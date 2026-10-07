@@ -10,13 +10,19 @@
 local _, ns = ...
 
 local panel, category
-local currentScope = "raid"
+local currentScope = "player"
 local refreshers = {}   -- functions that re-read the current scope into widgets
 
 local function S() return ns.GetSettings(currentScope) end
 
 local function Changed()
     ns.Refresh()
+end
+
+-- Re-read every widget; keeps linked controls (swatch + opacity, parent +
+-- dependent checkbox) in sync after any edit.
+local function RefreshWidgets()
+    for _, fn in ipairs(refreshers) do fn() end
 end
 
 -------------------------------------------------------------------------------
@@ -38,7 +44,8 @@ local function Note(parent, text, x, y, width)
     return fs
 end
 
-local function Checkbox(parent, label, x, y, key, tooltip)
+-- requires: another setting key; this box is disabled while that one is off.
+local function Checkbox(parent, label, x, y, key, tooltip, requires)
     local cb = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
     cb:SetSize(24, 24)
     cb:SetPoint("TOPLEFT", x, y)
@@ -49,7 +56,16 @@ local function Checkbox(parent, label, x, y, key, tooltip)
     cb:SetScript("OnClick", function(self)
         S()[key] = self:GetChecked() and true or false
         Changed()
+        RefreshWidgets()
     end)
+    if requires then
+        cb:SetMotionScriptsWhileDisabled(true)
+        refreshers[#refreshers + 1] = function()
+            local on = S()[requires] and true or false
+            cb:SetEnabled(on)
+            fs:SetFontObject(on and "GameFontHighlight" or "GameFontDisable")
+        end
+    end
     if tooltip then
         cb:SetScript("OnEnter", function(self)
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
@@ -86,7 +102,7 @@ local function Swatch(parent, anchor, key)
             local a = ColorPickerFrame.GetColorAlpha and ColorPickerFrame:GetColorAlpha() or 1
             local t = S()[key]
             t.r, t.g, t.b, t.a = r, g, bl, a
-            Show()
+            RefreshWidgets()
             Changed()
         end
         ColorPickerFrame:SetupColorPickerAndShow({
@@ -96,7 +112,7 @@ local function Swatch(parent, anchor, key)
             cancelFunc = function()
                 local t = S()[key]
                 t.r, t.g, t.b, t.a = orig.r, orig.g, orig.b, orig.a
-                Show()
+                RefreshWidgets()
                 Changed()
             end,
         })
@@ -105,28 +121,76 @@ local function Swatch(parent, anchor, key)
     return b
 end
 
-local function Slider(parent, x, y, key, minV, maxV, fmt)
+local function HasAtlas(name)
+    return C_Texture and C_Texture.GetAtlasInfo and C_Texture.GetAtlasInfo(name) ~= nil
+end
+
+-- The Settings panel's own slider art (MinimalSliderTemplate's atlases), or
+-- nil when this client lacks any piece.
+local function MinimalSliderAtlases()
+    local middle = (HasAtlas("_Minimal_SliderBar_Middle") and "_Minimal_SliderBar_Middle")
+        or (HasAtlas("Minimal_SliderBar_Middle") and "Minimal_SliderBar_Middle")
+    if middle and HasAtlas("Minimal_SliderBar_Left") and HasAtlas("Minimal_SliderBar_Right")
+       and HasAtlas("Minimal_SliderBar_Button") then
+        return { left = "Minimal_SliderBar_Left", middle = middle, right = "Minimal_SliderBar_Right",
+                 thumb = "Minimal_SliderBar_Button" }
+    end
+end
+
+-- enabledIf: optional function(settings) -> bool; the slider is disabled while it's false.
+local function Slider(parent, x, y, key, minV, maxV, fmt, enabledIf)
     local s = CreateFrame("Slider", nil, parent)
     s:SetOrientation("HORIZONTAL")
-    s:SetSize(220, 16)
-    s:SetPoint("TOPLEFT", x, y)
     s:SetMinMaxValues(minV, maxV)
     s:SetValueStep(1)
     s:SetObeyStepOnDrag(true)
     s:EnableMouseWheel(true)
-    local track = s:CreateTexture(nil, "BACKGROUND")
-    track:SetPoint("LEFT")
-    track:SetPoint("RIGHT")
-    track:SetHeight(6)
-    track:SetColorTexture(0, 0, 0, 0.6)
-    s:SetThumbTexture("Interface\\Buttons\\UI-SliderBar-Button-Horizontal")
+
+    -- `track` is the visible bar; labels hang off its ends.
+    local track, gap
+    local atlas = MinimalSliderAtlases()
+    if atlas then
+        -- Blizzard's layout: caps at the frame edges, thumb travels flush to them.
+        s:SetSize(220, 16)
+        s:SetPoint("TOPLEFT", x, y)
+        local left = s:CreateTexture(nil, "BORDER")
+        left:SetAtlas(atlas.left, true)
+        left:SetPoint("LEFT")
+        local right = s:CreateTexture(nil, "BORDER")
+        right:SetAtlas(atlas.right, true)
+        right:SetPoint("RIGHT")
+        local middle = s:CreateTexture(nil, "BORDER")
+        middle:SetAtlas(atlas.middle)
+        middle:SetPoint("TOPLEFT", left, "TOPRIGHT")
+        middle:SetPoint("BOTTOMRIGHT", right, "BOTTOMLEFT")
+        local thumb = s:CreateTexture(nil, "ARTWORK")
+        thumb:SetAtlas(atlas.thumb, true)
+        s:SetThumbTexture(thumb)
+        track, gap = s, 2
+    else
+        -- The thumb's center travels from THUMB/2 to width - THUMB/2, so the frame
+        -- is widened by THUMB and the track drawn only over that travel. An explicit
+        -- thumb size keeps the range right before the texture has loaded.
+        local THUMB = 32
+        s:SetSize(220 + THUMB, 16)
+        s:SetPoint("TOPLEFT", x - THUMB / 2, y)
+        s:SetThumbTexture("Interface\\Buttons\\UI-SliderBar-Button-Horizontal")
+        s:GetThumbTexture():SetSize(THUMB, THUMB)
+        track = s:CreateTexture(nil, "BACKGROUND")
+        track:SetPoint("LEFT", THUMB / 2, 0)
+        track:SetPoint("RIGHT", -THUMB / 2, 0)
+        track:SetHeight(6)
+        track:SetColorTexture(0, 0, 0, 0.6)
+        gap = 7
+    end
+
     local label = s:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
-    label:SetPoint("BOTTOMLEFT", s, "TOPLEFT", 0, 2)
+    label:SetPoint("BOTTOMLEFT", track, "TOPLEFT", 0, gap)
     local low = s:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
-    low:SetPoint("TOPLEFT", s, "BOTTOMLEFT", 0, -1)
+    low:SetPoint("TOPLEFT", track, "BOTTOMLEFT", 0, 1 - gap)
     low:SetText(minV .. "%")
     local high = s:CreateFontString(nil, "ARTWORK", "GameFontDisableSmall")
-    high:SetPoint("TOPRIGHT", s, "BOTTOMRIGHT", 0, -1)
+    high:SetPoint("TOPRIGHT", track, "BOTTOMRIGHT", 0, 1 - gap)
     high:SetText(maxV .. "%")
 
     local refreshing = false
@@ -147,6 +211,12 @@ local function Slider(parent, x, y, key, minV, maxV, fmt)
         s:SetValue(S()[key] or minV)
         label:SetText(fmt:format(S()[key] or minV))
         refreshing = false
+        if enabledIf then
+            local on = enabledIf(S()) and true or false
+            s:SetEnabled(on)
+            s:GetThumbTexture():SetDesaturated(not on)
+            label:SetFontObject(on and "GameFontHighlightSmall" or "GameFontDisableSmall")
+        end
     end
     return s
 end
@@ -176,14 +246,14 @@ local function RefreshAll()
     shareCB:SetChecked(ns.db.sharePartyRaid)
     local eff = ns.EffectiveScope(currentScope)
     if ns.db.sharePartyRaid and (currentScope == "party" or currentScope == "raid") then
-        scopeNote:SetText("Editing: Party & Raid (shared)")
+        scopeNote:SetText("Shared: Party uses the Raid settings. Turning sharing off restores Party's previous settings.")
     else
         scopeNote:SetText("Editing: " .. ns.SCOPE_LABELS[currentScope] .. " frames")
     end
     for scope, b in pairs(copyButtons) do
         b:SetEnabled(ns.EffectiveScope(scope) ~= eff)
     end
-    for _, fn in ipairs(refreshers) do fn() end
+    RefreshWidgets()
 end
 
 local function Build()
@@ -216,9 +286,21 @@ local function Build()
     shareLabel:SetText("Party and Raid share settings")
     shareCB:SetScript("OnClick", function(self)
         ns.db.sharePartyRaid = self:GetChecked() and true or false
+        if not ns.db.sharePartyRaid then
+            ns.Print("sharing off: Party's previous settings are restored.")
+        end
         Changed()
         RefreshAll()
     end)
+    shareCB:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Party and Raid share settings", 1, 1, 1)
+        GameTooltip:AddLine("While on, party frames use the Raid settings: the Party tab edits them, and "
+            .. "copying to Party copies to Raid. Party's previous settings are kept and restored when "
+            .. "this is turned off.", nil, nil, nil, true)
+        GameTooltip:Show()
+    end)
+    shareCB:SetScript("OnLeave", GameTooltip_Hide)
     scopeNote = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     scopeNote:SetPoint("TOPLEFT", 16, -88)
 
@@ -247,12 +329,15 @@ local function Build()
     Note(panel, "Bars switch color when health + all incoming heals exceed max health by the threshold.",
         R, -232, 270)
 
-    Header(panel, "Heal Order", R, -270)
-    Checkbox(panel, "Order heals by landing time", R, -288, "landingOrder",
-        "While you are casting, other healers' casts that finish before yours are drawn ahead of your heal. "
-        .. "Needs readable cast times; when the client hides them (restricted combat) your heals are drawn first.")
-    Note(panel, "Uses each healer's cast end time, not cast start. Falls back to your heals first when the client hides cast times.",
-        R, -316, 270)
+    Header(panel, "Class Colors", R, -270)
+    Checkbox(panel, "Color heals by healer's class", R, -288, "useClassColors",
+        "Each group healer's incoming heals are drawn in their EllesmereUI class color. "
+        .. "Healers outside your group keep the other players' color.")
+    Checkbox(panel, "Also use my class color for my heals", R + 20, -314, "classColorMine",
+        "Your heals use your EllesmereUI class color instead of your own color.",
+        "useClassColors")
+    Slider(panel, R + 4, -358, "classColorAlpha", 0, 100, "Class color opacity: %d%%",
+        function(s) return s.useClassColors end)
 
     -- Copy / reset / test
     Header(panel, "Copy this tab's settings to", L, -360)
@@ -281,8 +366,16 @@ local function Build()
     local test = Button(panel, "Toggle test bars", 130)
     test:SetPoint("LEFT", reset, "RIGHT", 8, 0)
     test:SetScript("OnClick", function() SlashCmdList.FOREVERHEALPREDICT("test") end)
-    Note(panel, "Test bars draw fake heals on every frame; alternate frames show the overheal colors. "
+    Note(panel, "Test bars draw fake heals on every frame; alternate frames show the overheal colors, "
+        .. "and with class colors on, part of the other players' bar shows a sample healer class. "
         .. "Units at full health only show them inside the overflow area.", L, -446, 560)
+
+    Header(panel, "Master Opacity", L, -496)
+    Slider(panel, L + 4, -532, "masterOpacity", 0, 100, "Master opacity: %d%%",
+        function(s) return not s.useClassColors end)
+    Note(panel, "Scales the opacity of every color you picked above (your heals, other players' heals "
+        .. "and both overheal colors), on top of each color's own opacity. Off while class colors are "
+        .. "on, since those use the class color opacity instead.", R, -516, 270)
 
     panel:SetScript("OnShow", RefreshAll)
 end
@@ -297,6 +390,8 @@ function ns.InitOptions()
 end
 
 function ns.OpenOptions()
+    currentScope = ns.SCOPES[1]
+    RefreshAll()
     if category and Settings and Settings.OpenToCategory then
         Settings.OpenToCategory(category:GetID())
     end

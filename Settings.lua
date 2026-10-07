@@ -21,6 +21,9 @@ local function ScopeDefaults(my, other, overflowOn, overflowPct)
         myColor            = Color(my[1], my[2], my[3], 1),
         otherColor         = Color(other[1], other[2], other[3], 1),
         useHealthTexture   = false,
+        useClassColors     = false,         -- each group healer's heals in their EllesmereUI class color
+        classColorMine     = false,         -- ...and your own heals in yours
+        classColorAlpha    = 60,            -- % opacity of class-colored bars
 
         overflowEnabled    = overflowOn,
         overflowPct        = overflowPct,   -- % of max health heals may run past the bar end
@@ -31,7 +34,7 @@ local function ScopeDefaults(my, other, overflowOn, overflowPct)
         myOverhealColor    = Color(0.90, 0.55, 0.10, 1),
         otherOverhealColor = Color(0.70, 0.38, 0.08, 1),
 
-        landingOrder       = false,
+        masterOpacity      = 100,           -- % multiplier on the colors above; ignored with class colors
     }
 end
 

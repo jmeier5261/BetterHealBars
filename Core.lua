@@ -12,7 +12,8 @@
 --    * the overflow limit is the calculator's overflow percent + a clip frame,
 --    * the overheal threshold is the calculator's "clamped" boolean at an
 --      overflow of (1 + threshold), turned into a color by C_CurveUtil,
---    * landing order needs cast end times; those are used only when plain.
+--    * class colors split "others" into one bar per group healer, each read
+--      with that healer as the calculator's source.
 --
 --  Copyright (C) 2026 jmeier5261
 --  Licensed under the GNU General Public License v3.0. See LICENSE.
@@ -20,13 +21,14 @@
 local ADDON_NAME, ns = ...
 
 local issecretvalue = issecretvalue or function() return false end
-local CreateFrame, UnitExists, UnitIsUnit, IsInRaid = CreateFrame, UnitExists, UnitIsUnit, IsInRaid
-local UnitCastingInfo = UnitCastingInfo
+local CreateFrame, UnitExists, UnitIsUnit, UnitClass = CreateFrame, UnitExists, UnitIsUnit, UnitClass
 local pairs, ipairs, wipe, type = pairs, ipairs, wipe, type
 
 local WHITE = "Interface\\Buttons\\WHITE8X8"
-local MAX_SEGS = 8   -- other healers' casts drawn ahead of yours (landing order)
 local EMPTY = {}
+-- Other classes' heals still show, in the "other players" color.
+local HEALER_CLASSES = { PRIEST = true, DRUID = true, PALADIN = true, SHAMAN = true, MONK = true, EVOKER = true }
+local TEST_CLASSES = { "PRIEST", "DRUID", "PALADIN", "SHAMAN", "MONK", "EVOKER" }
 
 -- Region points per growth direction. NEAR = a bar's leading edge (where it
 -- starts), FAR = a fill's trailing edge (where the next bar chains on). Paired
@@ -48,19 +50,15 @@ local unitMap = {}   -- unit token -> { rec, ... }
 local mapDirty = true
 local dirty = {}
 local allDirty = false
-local casting = {}   -- group unit token -> cast end time (ms), plain values only
 local calc, scratch  -- shared calculators (paints are sequential)
+local roster = {}    -- flat { unit, classToken, ... }: group healers other than you
+local playerClass
 
 ns.settingsGen = 0
 ns.testMode = false
 ns.stats = {
     secretAmounts = false, lastError = nil, apiOK = false,
-    -- Cast end time reads from UnitCastingInfo, split by outcome.
-    -- [who] = { plain = n, secret = n, missing = n }, who = "player" | "others"
-    castTimes = { player = { plain = 0, secret = 0, missing = 0 }, others = { plain = 0, secret = 0, missing = 0 } },
-    orderedPaints = 0,   -- paints that actually drew another healer ahead of you
 }
-ns.castDebug = false
 
 -------------------------------------------------------------------------------
 --  Painting
@@ -75,7 +73,8 @@ local function NewBar(parent)
 end
 
 -- flag: nil/false/true or a SECRET boolean. Never compared directly.
-local function Tint(bar, flag, cOn, cOff)
+-- mult: master opacity multiplier applied on top of each color's own alpha.
+local function Tint(bar, flag, cOn, cOff, mult)
     local tex = bar:GetStatusBarTexture()
     if not tex then return end
     if issecretvalue(flag) then
@@ -83,9 +82,9 @@ local function Tint(bar, flag, cOn, cOff)
         if ev then
             tex:SetVertexColor(ev(flag, cOn.r, cOff.r), ev(flag, cOn.g, cOff.g), ev(flag, cOn.b, cOff.b))
             if tex.SetAlphaFromBoolean then
-                tex:SetAlphaFromBoolean(flag, cOn.a or 1, cOff.a or 1)
+                tex:SetAlphaFromBoolean(flag, (cOn.a or 1) * mult, (cOff.a or 1) * mult)
             else
-                tex:SetAlpha(cOff.a or 1)
+                tex:SetAlpha((cOff.a or 1) * mult)
             end
             return
         end
@@ -93,7 +92,26 @@ local function Tint(bar, flag, cOn, cOff)
     end
     local c = flag and cOn or cOff
     tex:SetVertexColor(c.r, c.g, c.b)
-    tex:SetAlpha(c.a or 1)
+    tex:SetAlpha((c.a or 1) * mult)
+end
+
+-- EllesmereUI's palette (custom colors + darken) when readable; a secret token
+-- can't be a table key, so it gets Blizzard's shade. Fills `out` with the
+-- given opacity; returns `fallback` when the class is unknown.
+local function ClassColor(token, alpha, out, fallback)
+    local c
+    if issecretvalue(token) then
+        c = C_ClassColor and C_ClassColor.GetClassColor and C_ClassColor.GetClassColor(token)
+    elseif not token then
+        return fallback
+    elseif EllesmereUI and EllesmereUI.GetClassColor then
+        c = EllesmereUI.GetClassColor(token)
+    else
+        c = RAID_CLASS_COLORS and RAID_CLASS_COLORS[token]
+    end
+    if not c then return fallback end
+    out.r, out.g, out.b, out.a = c.r, c.g, c.b, alpha
+    return out
 end
 
 local function PlaceBar(bar, target, pts, near, vert, rev, w, h, tex)
@@ -111,7 +129,7 @@ local function PlaceBar(bar, target, pts, near, vert, rev, w, h, tex)
 end
 
 -- Anchors only; skipped when nothing that affects geometry has changed.
-local function Layout(rec, S, nB)
+local function Layout(rec, S, nS)
     local health = rec.health
     local fill = health:GetStatusBarTexture()
     if not fill then return false end
@@ -136,10 +154,10 @@ local function Layout(rec, S, nB)
 
     local L = rec.L
     if L.fill == fill and L.dir == dir and L.inv == inv and L.w == w and L.h == h
-       and L.ext == ext and L.nB == nB and L.tex == tex and L.gen == ns.settingsGen then
+       and L.ext == ext and L.nS == nS and L.tex == tex and L.gen == ns.settingsGen then
         return true
     end
-    L.fill, L.dir, L.inv, L.w, L.h, L.ext, L.nB, L.tex, L.gen = fill, dir, inv, w, h, ext, nB, tex, ns.settingsGen
+    L.fill, L.dir, L.inv, L.w, L.h, L.ext, L.nS, L.tex, L.gen = fill, dir, inv, w, h, ext, nS, tex, ns.settingsGen
 
     -- Holder = health bar rect plus the overflow allowance; it clips everything.
     local holder = rec.holder
@@ -154,22 +172,8 @@ local function Layout(rec, S, nB)
     local near, far = NEAR[dir], FAR[dir]
     local rev = (dir == "LEFT" or dir == "DOWN")
 
-    -- Chain: [other healers landing before you] -> [your heals]
+    -- Chain: [your heals] -> [one bar per group healer (class colors)]
     local prev, prevPts = fill, seamPts
-    for i = 1, MAX_SEGS do
-        local seg = rec.segs[i]
-        if i <= nB then
-            if not seg then
-                seg = NewBar(holder)
-                rec.segs[i] = seg
-            end
-            PlaceBar(seg, prev, prevPts, near, vert, rev, w, h, tex)
-            seg:Show()
-            prev, prevPts = seg:GetStatusBarTexture(), far
-        elseif seg then
-            seg:Hide()
-        end
-    end
     if S.showMine then
         PlaceBar(rec.mine, prev, prevPts, near, vert, rev, w, h, tex)
         rec.mine:Show()
@@ -177,6 +181,17 @@ local function Layout(rec, S, nB)
     else
         rec.mine:Hide()
     end
+    for i = 1, nS do
+        local seg = rec.segs[i]
+        if not seg then
+            seg = NewBar(holder)
+            rec.segs[i] = seg
+        end
+        PlaceBar(seg, prev, prevPts, near, vert, rev, w, h, tex)
+        seg:Show()
+        prev, prevPts = seg:GetStatusBarTexture(), far
+    end
+    for i = nS + 1, #rec.segs do rec.segs[i]:Hide() end
 
     -- Remaining others: a bar of the full amount drawn from the seam, but seen
     -- only through a clip that starts where the chain ends. That shows exactly
@@ -199,28 +214,6 @@ local function SetRange(bar, maxHP)
     bar:SetMinMaxValues(0, maxHP)
 end
 
--- Fills `out` with other group healers' amounts on `unit` whose casts finish
--- before yours. Returns the count. Only plain cast times are ever stored.
-local function CollectEarlierHeals(unit, out)
-    local myEnd = casting.player
-    if not myEnd then return 0 end
-    local now = GetTime() * 1000
-    local n = 0
-    for token, endMs in pairs(casting) do
-        if endMs < now - 1000 then
-            -- Missed stop event (unit went out of range etc.).
-            casting[token] = nil
-        elseif token ~= "player" and endMs < myEnd then
-            UnitGetDetailedHealPrediction(unit, token, scratch)
-            local _, amt = scratch:GetIncomingHeals()
-            n = n + 1
-            out[n] = amt
-            if n >= MAX_SEGS then break end
-        end
-    end
-    return n
-end
-
 local function Paint(rec)
     local S = ns.GetSettings(rec.scope)
     local unit = rec.unit
@@ -230,16 +223,21 @@ local function Paint(rec)
     end
 
     local total, mine, others, maxHP, over
-    local nB = 0
-    local segVals = rec.segVals
-    local ordered = S.landingOrder and S.showMine and S.showOthers
+    local nS = 0
+    local segVals, segClass = rec.segVals, rec.segClass
+    local bySource = S.useClassColors and S.showOthers
 
     if ns.testMode then
         maxHP, mine, others, total = 100, 20, 15, 35
-        if ordered then nB = 1; segVals[1] = 6 end
+        if bySource then
+            nS = 1
+            segVals[1] = 8
+            segClass[1] = TEST_CLASSES[rec.testIndex % #TEST_CLASSES + 1]
+        end
         over = (rec.testIndex % 2 == 0)
     else
-        calc:SetIncomingHealOverflowPercent(S.overflowEnabled and (1 + (S.overflowPct or 0) / 100) or 1)
+        local overflow = S.overflowEnabled and (1 + (S.overflowPct or 0) / 100) or 1
+        calc:SetIncomingHealOverflowPercent(overflow)
         UnitGetDetailedHealPrediction(unit, "player", calc)
         total, mine, others = calc:GetIncomingHeals()
         maxHP = calc:GetMaximumHealth()
@@ -250,9 +248,16 @@ local function Paint(rec)
             over = clamped
         end
         ns.stats.secretAmounts = issecretvalue(total)
-        if ordered then
-            nB = CollectEarlierHeals(unit, segVals)
-            if nB > 0 then ns.stats.orderedPaints = ns.stats.orderedPaints + 1 end
+        if bySource then
+            -- Healer as the source: its "mine" is that healer's amount on this unit.
+            scratch:SetIncomingHealOverflowPercent(overflow)
+            for i = 1, #roster, 2 do
+                UnitGetDetailedHealPrediction(unit, roster[i], scratch)
+                local _, amt = scratch:GetIncomingHeals()
+                nS = nS + 1
+                segVals[nS] = amt
+                segClass[nS] = roster[i + 1]
+            end
         end
     end
 
@@ -260,28 +265,37 @@ local function Paint(rec)
         rec.holder:Hide()
         return
     end
-    if not Layout(rec, S, nB) then
+    if not Layout(rec, S, nS) then
         rec.holder:Hide()
         return
     end
 
     local otherFlag = S.overhealOthers and over
-    for i = 1, nB do
-        local seg = rec.segs[i]
-        SetRange(seg, maxHP)
-        seg:SetValue(segVals[i])
-        Tint(seg, otherFlag, S.otherOverhealColor, S.otherColor)
-    end
+    local classAlpha = (S.classColorAlpha or 60) / 100
+    -- Class colors have their own opacity, so the master multiplier is off with them.
+    local master = S.useClassColors and 1 or (S.masterOpacity or 100) / 100
     if S.showMine then
         SetRange(rec.mine, maxHP)
         rec.mine:SetValue(mine)
-        Tint(rec.mine, S.overhealMine and over, S.myOverhealColor, S.myColor)
+        local myColor = S.myColor
+        if S.useClassColors and S.classColorMine then
+            myColor = ClassColor(playerClass, classAlpha, rec.mineColor, S.myColor)
+        end
+        Tint(rec.mine, S.overhealMine and over, S.myOverhealColor, myColor, master)
+    end
+    for i = 1, nS do
+        local seg = rec.segs[i]
+        SetRange(seg, maxHP)
+        seg:SetValue(segVals[i])
+        local cols = rec.segColors
+        cols[i] = cols[i] or {}
+        Tint(seg, otherFlag, S.otherOverhealColor, ClassColor(segClass[i], classAlpha, cols[i], S.otherColor), master)
     end
     if S.showOthers then
         SetRange(rec.rest, maxHP)
         -- Explicit branch: `a and total or others` would truth-test a secret.
         if S.showMine then rec.rest:SetValue(total) else rec.rest:SetValue(others) end
-        Tint(rec.rest, otherFlag, S.otherOverhealColor, S.otherColor)
+        Tint(rec.rest, otherFlag, S.otherOverhealColor, S.otherColor, master)
     end
     rec.holder:Show()
 end
@@ -385,7 +399,10 @@ local function HookHealth(rec, health)
 end
 
 local function BuildRecord(owner, health, kind, scope)
-    local rec = { owner = owner, health = health, kind = kind, scope = scope, segs = {}, segVals = {}, L = {} }
+    local rec = {
+        owner = owner, health = health, kind = kind, scope = scope, L = {},
+        segs = {}, segVals = {}, segClass = {}, segColors = {}, mineColor = {},
+    }
     local holder = CreateFrame("Frame", nil, owner)
     holder:SetClipsChildren(true)
     holder:Hide()
@@ -474,89 +491,52 @@ function ns.CountFrames()
 end
 
 -------------------------------------------------------------------------------
---  Cast tracking (landing order)
--------------------------------------------------------------------------------
-local function AnyLandingOrder()
-    for _, scope in ipairs(ns.SCOPES) do
-        if ns.GetSettings(scope).landingOrder then return true end
-    end
-    return false
-end
-
-local function IsGroupToken(u)
-    if u == "player" then return true end
-    if IsInRaid() then return u:find("^raid%d") ~= nil end
-    return u:find("^party%d") ~= nil
-end
-
-local function Readable(v, fallback)
-    if issecretvalue(v) then return "<hidden>" end
-    return v or fallback
-end
-
-local function CastDebug(u, result, endMs)
-    if not ns.castDebug then return end
-    local caster = Readable(UnitName(u), "?")
-    local spell = Readable(UnitCastingInfo(u), "?")
-    local endText
-    if result == "plain" then
-        endText = ("|cff40ff40readable|r, lands in %.2fs"):format((endMs - GetTime() * 1000) / 1000)
-    elseif result == "SECRET" then
-        endText = "|cffff4040hidden by client|r"
-    else
-        endText = "|cffff4040no cast info|r"
-    end
-    print(("|cff33ccffFHP|r caster: %s (%s), spell: %s, end time: %s"):format(caster, u, spell, endText))
-end
-
-local function CastStarted(u)
-    local who = (u == "player") and "player" or "others"
-    if who == "others" then
-        -- Your own raid/party token would duplicate "player".
-        local same = UnitIsUnit(u, "player")
-        if not issecretvalue(same) and same then return end
-    end
-    local counts = ns.stats.castTimes[who]
-    local _, _, _, _, endMs = UnitCastingInfo(u)
-    if issecretvalue(endMs) then
-        casting[u] = nil
-        counts.secret = counts.secret + 1
-        CastDebug(u, "SECRET")
-        return
-    end
-    if not endMs then
-        casting[u] = nil
-        counts.missing = counts.missing + 1
-        CastDebug(u, "no cast info")
-        return
-    end
-    counts.plain = counts.plain + 1
-    casting[u] = endMs
-    CastDebug(u, "plain", endMs)
-end
-
--------------------------------------------------------------------------------
 --  Startup checks
 -------------------------------------------------------------------------------
+local function NewCalculator()
+    local c = CreateUnitHealPredictionCalculator()
+    if not (c.GetIncomingHeals and c.SetIncomingHealOverflowPercent and c.SetIncomingHealClampMode) then
+        return nil
+    end
+    c:SetIncomingHealClampMode(Enum.UnitIncomingHealClampMode.MissingHealth)
+    if c.SetMaximumHealthMode and Enum.UnitMaximumHealthMode then
+        c:SetMaximumHealthMode(Enum.UnitMaximumHealthMode.Default)
+    end
+    if c.SetHealAbsorbMode and Enum.UnitHealAbsorbMode then
+        c:SetHealAbsorbMode(Enum.UnitHealAbsorbMode.ReducedByIncomingHeals)
+    end
+    return c
+end
+
 local function InitCalculators()
     if not (CreateUnitHealPredictionCalculator and UnitGetDetailedHealPrediction and Enum
             and Enum.UnitIncomingHealClampMode) then
         return false
     end
-    calc = CreateUnitHealPredictionCalculator()
-    if not (calc.GetIncomingHeals and calc.SetIncomingHealOverflowPercent and calc.SetIncomingHealClampMode) then
-        return false
+    calc, scratch = NewCalculator(), NewCalculator()
+    return calc ~= nil and scratch ~= nil
+end
+
+-- Group members whose heals get their own class-colored bar. Your own token
+-- is skipped (your heals are the "mine" bar); so is any member the client
+-- won't confirm isn't you, so your heals are never drawn twice.
+local function RebuildRoster()
+    wipe(roster)
+    local inRaid = IsInRaid()
+    local n = GetNumGroupMembers() or 0
+    local prefix = inRaid and "raid" or "party"
+    local count = inRaid and n or math.max(n - 1, 0)
+    for i = 1, count do
+        local u = prefix .. i
+        local same = UnitIsUnit(u, "player")
+        if not issecretvalue(same) and not same then
+            local _, token = UnitClass(u)
+            if issecretvalue(token) or (token and HEALER_CLASSES[token]) then
+                roster[#roster + 1] = u
+                roster[#roster + 1] = token
+            end
+        end
     end
-    calc:SetIncomingHealClampMode(Enum.UnitIncomingHealClampMode.MissingHealth)
-    if calc.SetMaximumHealthMode and Enum.UnitMaximumHealthMode then
-        calc:SetMaximumHealthMode(Enum.UnitMaximumHealthMode.Default)
-    end
-    if calc.SetHealAbsorbMode and Enum.UnitHealAbsorbMode then
-        calc:SetHealAbsorbMode(Enum.UnitHealAbsorbMode.ReducedByIncomingHeals)
-    end
-    scratch = CreateUnitHealPredictionCalculator()
-    scratch:SetIncomingHealClampMode(Enum.UnitIncomingHealClampMode.MaximumHealth)
-    return true
 end
 
 -- Which EllesmereUI frame types still have their own heal prediction on.
@@ -595,22 +575,12 @@ local UNIT_EVENTS = {
     UNIT_HEAL_PREDICTION = true, UNIT_HEALTH = true, UNIT_MAXHEALTH = true,
     UNIT_HEAL_ABSORB_AMOUNT_CHANGED = true,
 }
-local CAST_START = { UNIT_SPELLCAST_START = true, UNIT_SPELLCAST_DELAYED = true }
-local CAST_END = {
-    UNIT_SPELLCAST_STOP = true, UNIT_SPELLCAST_FAILED = true,
-    UNIT_SPELLCAST_INTERRUPTED = true, UNIT_SPELLCAST_SUCCEEDED = true,
-}
 
 events:SetScript("OnEvent", function(_, event, arg1)
     if UNIT_EVENTS[event] then
         MarkUnit(arg1)
-    elseif CAST_START[event] or CAST_END[event] then
-        if not (arg1 and IsGroupToken(arg1)) then return end
-        if CAST_START[event] then CastStarted(arg1) else casting[arg1] = nil end
-        -- Only reorders anything while you are casting (or when your cast changes).
-        if (arg1 == "player" or casting.player) and AnyLandingOrder() then MarkAll() end
     elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
-        wipe(casting)
+        RebuildRoster()
         Scan()
         MarkAll()
     elseif event == "ADDON_LOADED" then
@@ -622,11 +592,11 @@ events:SetScript("OnEvent", function(_, event, arg1)
             return
         end
         for e in pairs(UNIT_EVENTS) do events:RegisterEvent(e) end
-        for e in pairs(CAST_START) do events:RegisterEvent(e) end
-        for e in pairs(CAST_END) do events:RegisterEvent(e) end
         events:RegisterEvent("GROUP_ROSTER_UPDATE")
         events:RegisterEvent("PLAYER_ENTERING_WORLD")
         if ns.InitOptions then ns.InitOptions() end
+        playerClass = select(2, UnitClass("player"))
+        RebuildRoster()
         Scan()
         -- EllesmereUI builds buttons lazily (party header, extra frames, frame reloads).
         C_Timer.NewTicker(2, Scan)
@@ -646,17 +616,7 @@ local function Status()
     end
     print("  Party & raid shared: " .. tostring(ns.db.sharePartyRaid))
     print("  Last heal amounts secret: " .. tostring(ns.stats.secretAmounts))
-    print("  Cast end times (plain = usable for landing order):")
-    for _, who in ipairs({ "player", "others" }) do
-        local c = ns.stats.castTimes[who]
-        print(("    %s: |cff40ff40%d plain|r, |cffff4040%d secret|r, %d no cast info")
-            :format(who == "player" and "You" or "Group", c.plain, c.secret, c.missing))
-    end
-    print("  Paints that ordered another healer ahead of you: " .. ns.stats.orderedPaints)
-    local now = GetTime() * 1000
-    for token, endMs in pairs(casting) do
-        print(("    casting now: %s, lands in %.2fs"):format(token, (endMs - now) / 1000))
-    end
+    print("  Group healers with class-colored bars: " .. (#roster / 2))
     print("  Test mode: " .. tostring(ns.testMode))
     local on = ns.BuiltInPredictionScopes()
     if #on > 0 then print("  |cffffd100EllesmereUI heal prediction still on:|r " .. table.concat(on, ", ")) end
@@ -673,13 +633,6 @@ SlashCmdList.FOREVERHEALPREDICT = function(msg)
         MarkAll()
     elseif msg == "status" then
         Status()
-    elseif msg == "casts" then
-        ns.castDebug = not ns.castDebug
-        Print("cast time debug " .. (ns.castDebug and "on: every group cast start shows whether its end time is readable" or "off"))
-    elseif msg == "resetstats" then
-        for _, c in pairs(ns.stats.castTimes) do c.plain, c.secret, c.missing = 0, 0, 0 end
-        ns.stats.orderedPaints = 0
-        Print("cast statistics reset")
     elseif msg == "rescan" then
         Scan()
         MarkAll()
