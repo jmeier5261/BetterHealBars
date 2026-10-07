@@ -8,8 +8,9 @@
 -------------------------------------------------------------------------------
 local _, ns = ...
 
-ns.SCOPES = { "player", "party", "raid" }
-ns.SCOPE_LABELS = { player = "Player", party = "Party", raid = "Raid" }
+-- "unit" is EllesmereUIUnitFrames' player, target and focus frames.
+ns.SCOPES = { "unit", "party", "raid" }
+ns.SCOPE_LABELS = { unit = "Unit", party = "Party", raid = "Raid" }
 
 local function Color(r, g, b, a) return { r = r, g = g, b = b, a = a or 1 } end
 
@@ -37,10 +38,14 @@ local function ScopeDefaults(my, other, overflowOn, overflowPct)
 end
 
 ns.DEFAULTS = {
-    player = ScopeDefaults({ 0.043, 0.533, 0.412 }, { 0.082, 0.349, 0.282 }, true, 5),
+    unit   = ScopeDefaults({ 0.043, 0.533, 0.412 }, { 0.082, 0.349, 0.282 }, true, 5),
     party  = ScopeDefaults({ 0.043, 0.533, 0.412 }, { 0.082, 0.349, 0.282 }, true, 25),
     raid   = ScopeDefaults({ 0.043, 0.533, 0.412 }, { 0.082, 0.349, 0.282 }, true, 5),
 }
+-- Which unit frames draw; everything else on the Unit tab is shared by all three.
+ns.DEFAULTS.unit.framePlayer = true
+ns.DEFAULTS.unit.frameTarget = true
+ns.DEFAULTS.unit.frameFocus  = true
 
 local function DeepCopy(src)
     if type(src) ~= "table" then return src end
@@ -66,8 +71,11 @@ function ns.InitDB()
     local db = ForeverHealPredictDB
     db.version = 1
     if db.sharePartyRaid == nil then db.sharePartyRaid = false end
-    db.healSizes = db.healSizes or {}   -- player GUID -> { spellID -> { ratio, n } heal / tooltip average }
+    db.healSizes = db.healSizes or {}   -- player GUID -> { spellID -> { "lo-hi" tooltip -> { ratio, n, last } } }
     db.scopes = db.scopes or {}
+    -- The Player tab became the Unit tab (player, target and focus frames).
+    if db.scopes.player and not db.scopes.unit then db.scopes.unit = db.scopes.player end
+    db.scopes.player = nil
     for _, scope in ipairs(ns.SCOPES) do
         db.scopes[scope] = db.scopes[scope] or {}
         FillMissing(db.scopes[scope], ns.DEFAULTS[scope])

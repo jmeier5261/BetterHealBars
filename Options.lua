@@ -10,7 +10,7 @@
 local _, ns = ...
 
 local panel, category
-local currentScope = "player"
+local currentScope = "unit"
 local refreshers = {}   -- functions that re-read the current scope into widgets
 
 local function S() return ns.GetSettings(currentScope) end
@@ -247,6 +247,8 @@ local function RefreshAll()
     local eff = ns.EffectiveScope(currentScope)
     if ns.db.sharePartyRaid and (currentScope == "party" or currentScope == "raid") then
         scopeNote:SetText("Shared: Party uses the Raid settings. Turning sharing off restores Party's previous settings.")
+    elseif currentScope == "unit" then
+        scopeNote:SetText("Editing: Unit frames, shared by")
     else
         scopeNote:SetText("Editing: " .. ns.SCOPE_LABELS[currentScope] .. " frames")
     end
@@ -303,6 +305,18 @@ local function Build()
     shareCB:SetScript("OnLeave", GameTooltip_Hide)
     scopeNote = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     scopeNote:SetPoint("TOPLEFT", 16, -88)
+
+    -- Unit tab only: which of the three unit frames draw.
+    local frameBoxes = {}
+    local fx = 190
+    for _, f in ipairs({ { "framePlayer", "Player" }, { "frameTarget", "Target" }, { "frameFocus", "Focus" } }) do
+        local cb = Checkbox(panel, f[2], fx, -82, f[1])
+        frameBoxes[#frameBoxes + 1] = cb
+        fx = fx + 90
+    end
+    refreshers[#refreshers + 1] = function()
+        for _, cb in ipairs(frameBoxes) do cb:SetShown(currentScope == "unit") end
+    end
 
     -- Left column
     local L = 16
