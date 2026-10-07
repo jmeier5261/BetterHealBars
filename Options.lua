@@ -321,13 +321,12 @@ local function Build()
     -- Right column
     local R = 330
     Header(panel, "Overheal Recolor", R, -112)
-    Slider(panel, R + 4, -148, "overhealThreshold", 0, 100, "Threshold: %d%% over max health")
+    Slider(panel, R + 4, -148, "overhealThreshold", 0, 100, "Threshold: %d%% of my heal wasted")
     local cbMyOH = Checkbox(panel, "Recolor my heals", R, -178, "overhealMine")
     Swatch(panel, cbMyOH.label, "myOverhealColor")
-    local cbOtherOH = Checkbox(panel, "Recolor other players' heals", R, -204, "overhealOthers")
-    Swatch(panel, cbOtherOH.label, "otherOverhealColor")
-    Note(panel, "Bars switch color when health + all incoming heals exceed max health by the threshold.",
-        R, -232, 270)
+    Note(panel, "While you cast, your heal bar changes color when at least this share of the heal would "
+        .. "overheal. The heal's size is measured from your heals on yourself and your target, per spell rank.",
+        R, -206, 270)
 
     Header(panel, "Class Colors", R, -270)
     Checkbox(panel, "Color heals by healer's class", R, -288, "useClassColors",
@@ -366,7 +365,7 @@ local function Build()
     local test = Button(panel, "Toggle test bars", 130)
     test:SetPoint("LEFT", reset, "RIGHT", 8, 0)
     test:SetScript("OnClick", function() SlashCmdList.FOREVERHEALPREDICT("test") end)
-    Note(panel, "Test bars draw fake heals on every frame; alternate frames show the overheal colors, "
+    Note(panel, "Test bars draw fake heals on every frame; alternate frames show the overheal color, "
         .. "and with class colors on, part of the other players' bar shows a sample healer class. "
         .. "Units at full health only show them inside the overflow area.", L, -446, 560)
 
@@ -374,7 +373,7 @@ local function Build()
     Slider(panel, L + 4, -532, "masterOpacity", 0, 100, "Master opacity: %d%%",
         function(s) return not s.useClassColors end)
     Note(panel, "Scales the opacity of every color you picked above (your heals, other players' heals "
-        .. "and both overheal colors), on top of each color's own opacity. Off while class colors are "
+        .. "and the overheal color), on top of each color's own opacity. Off while class colors are "
         .. "on, since those use the class color opacity instead.", R, -516, 270)
 
     panel:SetScript("OnShow", RefreshAll)

@@ -28,11 +28,9 @@ local function ScopeDefaults(my, other, overflowOn, overflowPct)
         overflowEnabled    = overflowOn,
         overflowPct        = overflowPct,   -- % of max health heals may run past the bar end
 
-        overhealThreshold  = 20,            -- % of max health; (health + incoming) / max - 1 >= this
+        overhealThreshold  = 20,            -- % of your heal that would be wasted
         overhealMine       = false,
-        overhealOthers     = false,
         myOverhealColor    = Color(0.90, 0.55, 0.10, 1),
-        otherOverhealColor = Color(0.70, 0.38, 0.08, 1),
 
         masterOpacity      = 100,           -- % multiplier on the colors above; ignored with class colors
     }
@@ -68,10 +66,13 @@ function ns.InitDB()
     local db = ForeverHealPredictDB
     db.version = 1
     if db.sharePartyRaid == nil then db.sharePartyRaid = false end
+    db.healSizes = db.healSizes or {}   -- player GUID -> { spellID -> { ratio, n } heal / tooltip average }
     db.scopes = db.scopes or {}
     for _, scope in ipairs(ns.SCOPES) do
         db.scopes[scope] = db.scopes[scope] or {}
         FillMissing(db.scopes[scope], ns.DEFAULTS[scope])
+        -- Removed options.
+        db.scopes[scope].overhealOthers, db.scopes[scope].otherOverhealColor = nil, nil
     end
     ns.db = db
 end
