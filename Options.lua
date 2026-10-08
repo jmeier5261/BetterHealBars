@@ -265,8 +265,8 @@ local function Build()
 
     local title = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
     title:SetPoint("TOPLEFT", 16, -16)
-    title:SetText("Better Heal Bars")
-    Note(panel, "Incoming heal prediction for EllesmereUI player, party and raid frames.", 16, -38, 560)
+    title:SetText("Better Heal Bars - For EllesmereUI")
+    Note(panel, "Incoming heal prediction for EllesmereUI unit (player, target, focus), party and raid frames.", 16, -38, 560)
 
     -- Scope tabs + share toggle
     local x = 16

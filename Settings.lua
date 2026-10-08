@@ -19,8 +19,8 @@ local function ScopeDefaults(my, other, overflowOn, overflowPct)
     return {
         showMine           = true,
         showOthers         = true,
-        myColor            = Color(my[1], my[2], my[3], 1),
-        otherColor         = Color(other[1], other[2], other[3], 1),
+        myColor            = Color(my[1], my[2], my[3], 0.6),
+        otherColor         = Color(other[1], other[2], other[3], 0.6),
         useHealthTexture   = false,
         useClassColors     = false,         -- each group healer's heals in their EllesmereUI class color
         classColorMine     = false,         -- ...and your own heals in yours
@@ -31,16 +31,16 @@ local function ScopeDefaults(my, other, overflowOn, overflowPct)
 
         overhealThreshold  = 20,            -- % of your heal that would be wasted
         overhealMine       = false,
-        myOverhealColor    = Color(0.90, 0.55, 0.10, 1),
+        myOverhealColor    = Color(0.90, 0.55, 0.10, 0.6),
 
         masterOpacity      = 100,           -- % multiplier on the colors above; ignored with class colors
     }
 end
 
 ns.DEFAULTS = {
-    unit   = ScopeDefaults({ 0.043, 0.533, 0.412 }, { 0.082, 0.349, 0.282 }, true, 5),
-    party  = ScopeDefaults({ 0.043, 0.533, 0.412 }, { 0.082, 0.349, 0.282 }, true, 25),
-    raid   = ScopeDefaults({ 0.043, 0.533, 0.412 }, { 0.082, 0.349, 0.282 }, true, 5),
+    unit   = ScopeDefaults({ 0.043, 0.533, 0.412 }, { 0.082, 0.349, 0.282 }, true, 20),
+    party  = ScopeDefaults({ 0.043, 0.533, 0.412 }, { 0.082, 0.349, 0.282 }, true, 20),
+    raid   = ScopeDefaults({ 0.043, 0.533, 0.412 }, { 0.082, 0.349, 0.282 }, true, 20),
 }
 -- Which unit frames draw; everything else on the Unit tab is shared by all three.
 ns.DEFAULTS.unit.framePlayer = true
