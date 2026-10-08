@@ -1,7 +1,7 @@
 -------------------------------------------------------------------------------
 --  Options.lua
---  Settings panel (Game Menu > Options > AddOns > Forever HealPredict, or /fhp)
---  One page with Player / Party / Raid tabs; every control edits the tab's
+--  Settings panel (Game Menu > Options > AddOns > Better Heal Bars, or /bhb)
+--  One page with Unit / Party / Raid tabs; every control edits the tab's
 --  effective settings (party edits raid's while "share" is on).
 --
 --  Copyright (C) 2026 jmeier5261
@@ -10,7 +10,7 @@
 local _, ns = ...
 
 local panel, category
-local currentScope = "player"
+local currentScope = "unit"
 local refreshers = {}   -- functions that re-read the current scope into widgets
 
 local function S() return ns.GetSettings(currentScope) end
@@ -247,6 +247,8 @@ local function RefreshAll()
     local eff = ns.EffectiveScope(currentScope)
     if ns.db.sharePartyRaid and (currentScope == "party" or currentScope == "raid") then
         scopeNote:SetText("Shared: Party uses the Raid settings. Turning sharing off restores Party's previous settings.")
+    elseif currentScope == "unit" then
+        scopeNote:SetText("Editing: Unit frames, shared by")
     else
         scopeNote:SetText("Editing: " .. ns.SCOPE_LABELS[currentScope] .. " frames")
     end
@@ -259,11 +261,11 @@ end
 local function Build()
     panel = CreateFrame("Frame")
     panel:Hide()
-    panel.name = "Forever HealPredict"
+    panel.name = "Better Heal Bars"
 
     local title = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
     title:SetPoint("TOPLEFT", 16, -16)
-    title:SetText("Forever HealPredict")
+    title:SetText("Better Heal Bars")
     Note(panel, "Incoming heal prediction for EllesmereUI player, party and raid frames.", 16, -38, 560)
 
     -- Scope tabs + share toggle
@@ -304,6 +306,18 @@ local function Build()
     scopeNote = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
     scopeNote:SetPoint("TOPLEFT", 16, -88)
 
+    -- Unit tab only: which of the three unit frames draw.
+    local frameBoxes = {}
+    local fx = 190
+    for _, f in ipairs({ { "framePlayer", "Player" }, { "frameTarget", "Target" }, { "frameFocus", "Focus" } }) do
+        local cb = Checkbox(panel, f[2], fx, -82, f[1])
+        frameBoxes[#frameBoxes + 1] = cb
+        fx = fx + 90
+    end
+    refreshers[#refreshers + 1] = function()
+        for _, cb in ipairs(frameBoxes) do cb:SetShown(currentScope == "unit") end
+    end
+
     -- Left column
     local L = 16
     Header(panel, "Incoming Heals", L, -112)
@@ -321,13 +335,12 @@ local function Build()
     -- Right column
     local R = 330
     Header(panel, "Overheal Recolor", R, -112)
-    Slider(panel, R + 4, -148, "overhealThreshold", 0, 100, "Threshold: %d%% over max health")
+    Slider(panel, R + 4, -148, "overhealThreshold", 0, 100, "Threshold: %d%% of my heal wasted")
     local cbMyOH = Checkbox(panel, "Recolor my heals", R, -178, "overhealMine")
     Swatch(panel, cbMyOH.label, "myOverhealColor")
-    local cbOtherOH = Checkbox(panel, "Recolor other players' heals", R, -204, "overhealOthers")
-    Swatch(panel, cbOtherOH.label, "otherOverhealColor")
-    Note(panel, "Bars switch color when health + all incoming heals exceed max health by the threshold.",
-        R, -232, 270)
+    Note(panel, "While you cast, your heal bar changes color when at least this share of the heal would "
+        .. "overheal. The heal's size is measured from your heals on yourself and your target, per spell rank.",
+        R, -206, 270)
 
     Header(panel, "Class Colors", R, -270)
     Checkbox(panel, "Color heals by healer's class", R, -288, "useClassColors",
@@ -365,8 +378,8 @@ local function Build()
     end)
     local test = Button(panel, "Toggle test bars", 130)
     test:SetPoint("LEFT", reset, "RIGHT", 8, 0)
-    test:SetScript("OnClick", function() SlashCmdList.FOREVERHEALPREDICT("test") end)
-    Note(panel, "Test bars draw fake heals on every frame; alternate frames show the overheal colors, "
+    test:SetScript("OnClick", function() SlashCmdList.BETTERHEALBARS("test") end)
+    Note(panel, "Test bars draw fake heals on every frame; alternate frames show the overheal color, "
         .. "and with class colors on, part of the other players' bar shows a sample healer class. "
         .. "Units at full health only show them inside the overflow area.", L, -446, 560)
 
@@ -374,7 +387,7 @@ local function Build()
     Slider(panel, L + 4, -532, "masterOpacity", 0, 100, "Master opacity: %d%%",
         function(s) return not s.useClassColors end)
     Note(panel, "Scales the opacity of every color you picked above (your heals, other players' heals "
-        .. "and both overheal colors), on top of each color's own opacity. Off while class colors are "
+        .. "and the overheal color), on top of each color's own opacity. Off while class colors are "
         .. "on, since those use the class color opacity instead.", R, -516, 270)
 
     panel:SetScript("OnShow", RefreshAll)

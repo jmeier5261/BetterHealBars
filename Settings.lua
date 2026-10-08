@@ -1,6 +1,6 @@
 -------------------------------------------------------------------------------
 --  Settings.lua
---  Saved variables, defaults, per-scope resolution (player / party / raid),
+--  Saved variables, defaults, per-scope resolution (unit / party / raid),
 --  the party+raid share toggle and copy between scopes.
 --
 --  Copyright (C) 2026 jmeier5261
@@ -8,8 +8,9 @@
 -------------------------------------------------------------------------------
 local _, ns = ...
 
-ns.SCOPES = { "player", "party", "raid" }
-ns.SCOPE_LABELS = { player = "Player", party = "Party", raid = "Raid" }
+-- "unit" is EllesmereUIUnitFrames' player, target and focus frames.
+ns.SCOPES = { "unit", "party", "raid" }
+ns.SCOPE_LABELS = { unit = "Unit", party = "Party", raid = "Raid" }
 
 local function Color(r, g, b, a) return { r = r, g = g, b = b, a = a or 1 } end
 
@@ -28,21 +29,23 @@ local function ScopeDefaults(my, other, overflowOn, overflowPct)
         overflowEnabled    = overflowOn,
         overflowPct        = overflowPct,   -- % of max health heals may run past the bar end
 
-        overhealThreshold  = 20,            -- % of max health; (health + incoming) / max - 1 >= this
+        overhealThreshold  = 20,            -- % of your heal that would be wasted
         overhealMine       = false,
-        overhealOthers     = false,
         myOverhealColor    = Color(0.90, 0.55, 0.10, 1),
-        otherOverhealColor = Color(0.70, 0.38, 0.08, 1),
 
         masterOpacity      = 100,           -- % multiplier on the colors above; ignored with class colors
     }
 end
 
 ns.DEFAULTS = {
-    player = ScopeDefaults({ 0.043, 0.533, 0.412 }, { 0.082, 0.349, 0.282 }, true, 5),
+    unit   = ScopeDefaults({ 0.043, 0.533, 0.412 }, { 0.082, 0.349, 0.282 }, true, 5),
     party  = ScopeDefaults({ 0.043, 0.533, 0.412 }, { 0.082, 0.349, 0.282 }, true, 25),
     raid   = ScopeDefaults({ 0.043, 0.533, 0.412 }, { 0.082, 0.349, 0.282 }, true, 5),
 }
+-- Which unit frames draw; everything else on the Unit tab is shared by all three.
+ns.DEFAULTS.unit.framePlayer = true
+ns.DEFAULTS.unit.frameTarget = true
+ns.DEFAULTS.unit.frameFocus  = true
 
 local function DeepCopy(src)
     if type(src) ~= "table" then return src end
@@ -64,10 +67,11 @@ local function FillMissing(dst, defaults)
 end
 
 function ns.InitDB()
-    ForeverHealPredictDB = ForeverHealPredictDB or {}
-    local db = ForeverHealPredictDB
+    BetterHealBarsDB = BetterHealBarsDB or {}
+    local db = BetterHealBarsDB
     db.version = 1
     if db.sharePartyRaid == nil then db.sharePartyRaid = false end
+    db.healSizes = db.healSizes or {}   -- player GUID -> { spellID -> { "lo-hi" tooltip -> { ratio, n, last } } }
     db.scopes = db.scopes or {}
     for _, scope in ipairs(ns.SCOPES) do
         db.scopes[scope] = db.scopes[scope] or {}

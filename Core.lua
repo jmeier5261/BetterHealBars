@@ -1,7 +1,7 @@
 -------------------------------------------------------------------------------
 --  Core.lua
 --  Incoming heal bars on EllesmereUI frames (raid + party from
---  EllesmereUIRaidFrames, the player frame from EllesmereUIUnitFrames).
+--  EllesmereUIRaidFrames, player, target and focus from EllesmereUIUnitFrames).
 --
 --  WoW Forever runs the 12.x restricted API: in combat, heal / health values
 --  can be SECRET. Secrets may be passed to StatusBar:SetValue /
@@ -10,8 +10,12 @@
 --    * amounts come from a UnitHealPredictionCalculator and go straight to
 --      StatusBars that are chained by anchors (the layout engine does the sum),
 --    * the overflow limit is the calculator's overflow percent + a clip frame,
---    * the overheal threshold is the calculator's "clamped" boolean at an
---      overflow of (1 + threshold), turned into a color by C_CurveUtil,
+--    * overheal: while you cast, the part of your heal that fits (a secret)
+--      is the value of a StatusBar whose range is one HP wide around a plain
+--      cut-off (from your heal's size and the threshold). The bar's clamping
+--      leaves it either empty or full, and that geometry picks the color,
+--    * your heal's size is the spell tooltip's average times a ratio measured
+--      from your real non-crit heals, per spell ID (so per rank) and tooltip,
 --    * class colors split "others" into one bar per group healer, each read
 --      with that healer as the calculator's source.
 --
@@ -22,13 +26,19 @@ local ADDON_NAME, ns = ...
 
 local issecretvalue = issecretvalue or function() return false end
 local CreateFrame, UnitExists, UnitIsUnit, UnitClass = CreateFrame, UnitExists, UnitIsUnit, UnitClass
-local pairs, ipairs, wipe, type = pairs, ipairs, wipe, type
+local pairs, ipairs, wipe, type, tonumber = pairs, ipairs, wipe, type, tonumber
 
 local WHITE = "Interface\\Buttons\\WHITE8X8"
 local EMPTY = {}
 -- Other classes' heals still show, in the "other players" color.
 local HEALER_CLASSES = { PRIEST = true, DRUID = true, PALADIN = true, SHAMAN = true, MONK = true, EVOKER = true }
 local TEST_CLASSES = { "PRIEST", "DRUID", "PALADIN", "SHAMAN", "MONK", "EVOKER" }
+-- EllesmereUIUnitFrames frames; they share the "unit" settings, each with its own on/off.
+local UNIT_FRAMES = {
+    { global = "EllesmereUIUnitFrames_Player", toggle = "framePlayer", label = "Player" },
+    { global = "EllesmereUIUnitFrames_Target", toggle = "frameTarget", label = "Target" },
+    { global = "EllesmereUIUnitFrames_Focus",  toggle = "frameFocus",  label = "Focus" },
+}
 
 -- Region points per growth direction. NEAR = a bar's leading edge (where it
 -- starts), FAR = a fill's trailing edge (where the next bar chains on). Paired
@@ -48,16 +58,21 @@ local records = {}   -- owner frame -> rec
 local recList = {}
 local unitMap = {}   -- unit token -> { rec, ... }
 local mapDirty = true
+local ALIAS_TOKENS = { "target", "focus" }
 local dirty = {}
 local allDirty = false
 local calc, scratch  -- shared calculators (paints are sequential)
 local roster = {}    -- flat { unit, classToken, ... }: group healers other than you
 local playerClass
+local myCast         -- { spell, size, source } while you cast, else nil
+local healSizes = {} -- spellID -> tooltip range -> measured ratio; the saved table once logged in
 
 ns.settingsGen = 0
 ns.testMode = false
+ns.castDebug = false
 ns.stats = {
-    secretAmounts = false, lastError = nil, apiOK = false,
+    secretAmounts = false, lastError = nil, apiOK = false, lastCast = nil,
+    castTimes = { player = { plain = 0, secret = 0, missing = 0 }, others = { plain = 0, secret = 0, missing = 0 } },
 }
 
 -------------------------------------------------------------------------------
@@ -72,27 +87,25 @@ local function NewBar(parent)
     return bar
 end
 
--- flag: nil/false/true or a SECRET boolean. Never compared directly.
--- mult: master opacity multiplier applied on top of each color's own alpha.
-local function Tint(bar, flag, cOn, cOff, mult)
-    local tex = bar:GetStatusBarTexture()
-    if not tex then return end
-    if issecretvalue(flag) then
-        local ev = C_CurveUtil and C_CurveUtil.EvaluateColorValueFromBoolean
-        if ev then
-            tex:SetVertexColor(ev(flag, cOn.r, cOff.r), ev(flag, cOn.g, cOff.g), ev(flag, cOn.b, cOff.b))
-            if tex.SetAlphaFromBoolean then
-                tex:SetAlphaFromBoolean(flag, (cOn.a or 1) * mult, (cOff.a or 1) * mult)
-            else
-                tex:SetAlpha((cOff.a or 1) * mult)
-            end
-            return
-        end
-        flag = false
-    end
-    local c = flag and cOn or cOff
+-- mult: master opacity multiplier applied on top of the color's own alpha.
+local function ColorTex(tex, c, mult)
     tex:SetVertexColor(c.r, c.g, c.b)
     tex:SetAlpha((c.a or 1) * mult)
+end
+
+local function SetColor(bar, c, mult)
+    local tex = bar:GetStatusBarTexture()
+    if tex then ColorTex(tex, c, mult) end
+end
+
+-- Alpha aOn when flag is true, else aOff; flag may be SECRET.
+local function AlphaIf(tex, flag, aOn, aOff)
+    if not tex then return end
+    if issecretvalue(flag) then
+        if tex.SetAlphaFromBoolean then tex:SetAlphaFromBoolean(flag, aOn, aOff) else tex:SetAlpha(aOn) end
+    else
+        tex:SetAlpha(flag and aOn or aOff)
+    end
 end
 
 -- EllesmereUI's palette (custom colors + darken) when readable; a secret token
@@ -177,7 +190,29 @@ local function Layout(rec, S, nS)
     if S.showMine then
         PlaceBar(rec.mine, prev, prevPts, near, vert, rev, w, h, tex)
         rec.mine:Show()
-        prev, prevPts = rec.mine:GetStatusBarTexture(), far
+        local mineFill = rec.mine:GetStatusBarTexture()
+        prev, prevPts = mineFill, far
+
+        -- Overheal flag over your fill: flagBar ends up empty or full (see
+        -- Paint); flagRest covers whatever part of your fill it leaves bare.
+        local fb, fr = rec.flagBar, rec.flagRest
+        fb:SetFrameLevel(rec.mine:GetFrameLevel() + 1)
+        fb:ClearAllPoints()
+        fb:SetAllPoints(mineFill)
+        fb:SetOrientation(vert and "VERTICAL" or "HORIZONTAL")
+        fb:SetReverseFill(rev)
+        if fb.SetRotatesTexture then fb:SetRotatesTexture(vert) end
+        if fb._tex ~= tex then
+            fb:SetStatusBarTexture(tex)
+            fb._tex = tex
+        end
+        local fbFill = fb:GetStatusBarTexture()
+        fr:SetTexture(tex)
+        fr:ClearAllPoints()
+        fr:SetPoint(near[1], fbFill, far[1], 0, 0)
+        fr:SetPoint(near[2], fbFill, far[2], 0, 0)
+        fr:SetPoint(far[1], mineFill, far[1], 0, 0)
+        fr:SetPoint(far[2], mineFill, far[2], 0, 0)
     else
         rec.mine:Hide()
     end
@@ -210,6 +245,11 @@ local function Layout(rec, S, nS)
     return true
 end
 
+-- Most of your heal that can land and still count as wasting >= pct% (and >= 1).
+local function OverhealCut(size, pct)
+    return math.floor(math.min(size * (1 - (pct or 0) / 100), size - 1))
+end
+
 local function SetRange(bar, maxHP)
     bar:SetMinMaxValues(0, maxHP)
 end
@@ -217,12 +257,15 @@ end
 local function Paint(rec)
     local S = ns.GetSettings(rec.scope)
     local unit = rec.unit
-    if not (S.showMine or S.showOthers) or not unit or not rec.owner:IsVisible() or not UnitExists(unit) then
+    if not (S.showMine or S.showOthers) or (rec.toggle and not S[rec.toggle])
+       or not unit or not rec.owner:IsVisible() or not UnitExists(unit) then
         rec.holder:Hide()
         return
     end
 
     local total, mine, others, maxHP, over
+    local mineFit, useFlag   -- mineFit may be SECRET; useFlag is the plain "have it" flag
+    local overflows          -- SECRET or plain: health + incoming heals exceed max health
     local nS = 0
     local segVals, segClass = rec.segVals, rec.segClass
     local bySource = S.useClassColors and S.showOthers
@@ -241,11 +284,14 @@ local function Paint(rec)
         UnitGetDetailedHealPrediction(unit, "player", calc)
         total, mine, others = calc:GetIncomingHeals()
         maxHP = calc:GetMaximumHealth()
-        if S.overhealMine or S.overhealOthers then
-            -- Same fill, re-evaluated: clamped == health + incoming > max * (1 + threshold).
-            calc:SetIncomingHealOverflowPercent(1 + (S.overhealThreshold or 0) / 100)
-            local _, _, _, clamped = calc:GetIncomingHeals()
-            over = clamped
+        if myCast and myCast.size and S.overhealMine and S.showMine then
+            -- Same fill, re-evaluated, capped at missing health: the part of
+            -- your heal that lands.
+            calc:SetIncomingHealOverflowPercent(1)
+            local _, fit, _, clamped = calc:GetIncomingHeals()
+            mineFit, useFlag, overflows = fit, true, clamped
+            -- No flag from this client: don't let it block the recolor.
+            if not issecretvalue(overflows) and overflows == nil then overflows = true end
         end
         ns.stats.secretAmounts = issecretvalue(total)
         if bySource then
@@ -270,7 +316,6 @@ local function Paint(rec)
         return
     end
 
-    local otherFlag = S.overhealOthers and over
     local classAlpha = (S.classColorAlpha or 60) / 100
     -- Class colors have their own opacity, so the master multiplier is off with them.
     local master = S.useClassColors and 1 or (S.masterOpacity or 100) / 100
@@ -281,7 +326,31 @@ local function Paint(rec)
         if S.useClassColors and S.classColorMine then
             myColor = ClassColor(playerClass, classAlpha, rec.mineColor, S.myColor)
         end
-        Tint(rec.mine, S.overhealMine and over, S.myOverhealColor, myColor, master)
+        if useFlag then
+            -- Wasted >= threshold (and >= 1) <=> lands <= cut. Over the range
+            -- [cut, cut + 1] the bar clamps whole amounts to empty (flagged)
+            -- or full (not), so flagRest shows over all of your fill or none.
+            local cut = OverhealCut(myCast.size, S.overhealThreshold)
+            local fb = rec.flagBar
+            fb:SetMinMaxValues(cut, cut + 1)
+            fb:SetValue(mineFit)
+            SetColor(fb, myColor, master)
+            ColorTex(rec.flagRest, S.myOverhealColor, master)
+            fb:Show()
+            -- Only when the client says the heals overflow does the flag pair
+            -- draw (your fill hides under it); otherwise your fill shows as
+            -- normal. A heal that fits can't be flagged, even when the cut-off
+            -- is off (healing reduction on the target).
+            local myA = (myColor.a or 1) * master
+            AlphaIf(rec.mine:GetStatusBarTexture(), overflows, 0, myA)
+            AlphaIf(fb:GetStatusBarTexture(), overflows, myA, 0)
+            AlphaIf(rec.flagRest, overflows, (S.myOverhealColor.a or 1) * master, 0)
+        else
+            rec.flagBar:Hide()
+            SetColor(rec.mine, (S.overhealMine and over) and S.myOverhealColor or myColor, master)
+        end
+    else
+        rec.flagBar:Hide()
     end
     for i = 1, nS do
         local seg = rec.segs[i]
@@ -289,13 +358,13 @@ local function Paint(rec)
         seg:SetValue(segVals[i])
         local cols = rec.segColors
         cols[i] = cols[i] or {}
-        Tint(seg, otherFlag, S.otherOverhealColor, ClassColor(segClass[i], classAlpha, cols[i], S.otherColor), master)
+        SetColor(seg, ClassColor(segClass[i], classAlpha, cols[i], S.otherColor), master)
     end
     if S.showOthers then
         SetRange(rec.rest, maxHP)
         -- Explicit branch: `a and total or others` would truth-test a secret.
         if S.showMine then rec.rest:SetValue(total) else rec.rest:SetValue(others) end
-        Tint(rec.rest, otherFlag, S.otherOverhealColor, S.otherColor, master)
+        SetColor(rec.rest, S.otherColor, master)
     end
     rec.holder:Show()
 end
@@ -304,7 +373,7 @@ local function SafePaint(rec)
     local ok, err = pcall(Paint, rec)
     if not ok and ns.stats.lastError ~= err then
         ns.stats.lastError = err
-        print("|cff33ccffForever HealPredict|r error: " .. tostring(err))
+        print("|cff33ccffBetter Heal Bars|r error: " .. tostring(err))
     end
 end
 
@@ -333,6 +402,24 @@ local function RebuildMap()
             if u ~= "player" then
                 local same = UnitIsUnit(u, "player")
                 if not issecretvalue(same) and same then AddToMap("player", rec) end
+            end
+        end
+    end
+    -- Target and focus may be a group member, whose events can arrive under
+    -- the group token instead: list frames under both tokens.
+    for _, alias in ipairs(ALIAS_TOKENS) do
+        if unitMap[alias] and UnitExists(alias) then
+            local inRaid = IsInRaid()
+            for i = 1, inRaid and 40 or 4 do
+                local g = (inRaid and "raid" or "party") .. i
+                local same = UnitIsUnit(alias, g)
+                if not issecretvalue(same) and same then
+                    local a, b = unitMap[alias], unitMap[g] or EMPTY
+                    local na, nb = #a, #b   -- both lists grow below
+                    for j = 1, na do AddToMap(g, a[j]) end
+                    for j = 1, nb do AddToMap(alias, b[j]) end
+                    break
+                end
             end
         end
     end
@@ -387,8 +474,8 @@ end
 --  Frame discovery
 -------------------------------------------------------------------------------
 local function HookHealth(rec, health)
-    if health._fhpHooked then return end
-    health._fhpHooked = true
+    if health._bhbHooked then return end
+    health._bhbHooked = true
     health:HookScript("OnSizeChanged", function()
         local r = records[rec.owner]
         if r and r.health == health then
@@ -412,6 +499,9 @@ local function BuildRecord(owner, health, kind, scope)
     rec.afterClip = ac
     rec.rest = NewBar(ac)
     rec.mine = NewBar(holder)
+    rec.flagBar = NewBar(holder)
+    rec.flagBar:Hide()
+    rec.flagRest = rec.flagBar:CreateTexture(nil, "ARTWORK")
 
     records[owner] = rec
     recList[#recList + 1] = rec
@@ -431,15 +521,17 @@ local function BuildRecord(owner, health, kind, scope)
     return rec
 end
 
--- Returns true when something new was attached.
-local function Attach(owner, health, kind, scope)
+-- Returns true when something new was attached. toggle: for unit frames, the
+-- setting that turns this one frame on or off.
+local function Attach(owner, health, kind, scope, toggle)
     if not (owner and health and health.GetStatusBarTexture) then return false end
     local rec = records[owner]
     if not rec then
-        BuildRecord(owner, health, kind, scope)
+        BuildRecord(owner, health, kind, scope).toggle = toggle
         return true
     end
     local changed = false
+    rec.toggle = toggle
     if rec.scope ~= scope then rec.scope = scope; changed = true end
     if rec.health ~= health then
         -- Unit frame rebuilt its health bar (EllesmereUI reload of frames).
@@ -472,17 +564,19 @@ local function Scan()
             if d.health then changed = Attach(btn, d.health, "rf", "party") or changed end
         end
     end
-    local pf = _G.EllesmereUIUnitFrames_Player
-    if pf and pf.Health then
-        changed = Attach(pf, pf.Health, "uf", "player") or changed
+    for _, uf in ipairs(UNIT_FRAMES) do
+        local f = _G[uf.global]
+        if f and f.Health then
+            changed = Attach(f, f.Health, "uf", "unit", uf.toggle) or changed
+        end
     end
     if changed then MarkAll() end
 end
 ns.Scan = Scan
 
 function ns.CountFrames()
-    local counts = { player = 0, party = 0, raid = 0 }
-    local shown = { player = 0, party = 0, raid = 0 }
+    local counts = { unit = 0, party = 0, raid = 0 }
+    local shown = { unit = 0, party = 0, raid = 0 }
     for _, rec in ipairs(recList) do
         counts[rec.scope] = counts[rec.scope] + 1
         if rec.holder:IsShown() then shown[rec.scope] = shown[rec.scope] + 1 end
@@ -547,14 +641,363 @@ function ns.BuiltInPredictionScopes()
         if rns._scaledProfile and rns._scaledProfile.healPrediction then on[#on + 1] = "Raid Frames" end
         if rns._scaledPartyProxy and rns._scaledPartyProxy.healPrediction then on[#on + 1] = "Party Frames" end
     end
-    local pf = _G.EllesmereUIUnitFrames_Player
-    local ab = pf and pf.HealthPrediction and pf.HealthPrediction.damageAbsorb
-    if ab and ab._predOn then on[#on + 1] = "Player Frame" end
+    for _, uf in ipairs(UNIT_FRAMES) do
+        local f = _G[uf.global]
+        local ab = f and f.HealthPrediction and f.HealthPrediction.damageAbsorb
+        if ab and ab._predOn then on[#on + 1] = uf.label .. " Frame" end
+    end
     return on
 end
 
-local function Print(msg) print("|cff33ccffForever HealPredict|r " .. msg) end
+-------------------------------------------------------------------------------
+--  Your heal casts (the overheal recolor needs the heal's size as a plain number)
+-------------------------------------------------------------------------------
+-- The spell's description, or nil when there's none readable.
+local function SpellDescription(spellID)
+    local get = (C_Spell and C_Spell.GetSpellDescription) or GetSpellDescription
+    local text = get and get(spellID)
+    if type(text) ~= "string" or issecretvalue(text) then return nil end
+    return text
+end
+
+-- Separators inside a number in any client language: "1,234", "1.234",
+-- "1 234" (also with a no-break or narrow no-break space).
+local THOUSANDS = "(%d)[,%.%s\194\160\226\128\175]+(%d%d%d)%f[%D]"
+
+-- The heal range in the spell's description, in any client language. Only
+-- the numbers are read: the first two in a row that look like a range
+-- ("156 to 181", "156 bis 181", "156 à 181", "156~181"), i.e. the second is
+-- larger and at most 1.5x the first. Returns the average, low and high ends;
+-- without a range, the first number; nil when there's no readable amount.
+local function TooltipHealSize(spellID)
+    local text = SpellDescription(spellID)
+    if not text then return nil end
+    local n
+    repeat text, n = text:gsub(THOUSANDS, "%1%2") until n == 0
+    local nums = {}
+    for d in text:gmatch("%d+") do nums[#nums + 1] = tonumber(d) end
+    for i = 1, #nums - 1 do
+        local lo, hi = nums[i], nums[i + 1]
+        if lo >= 10 and hi > lo and hi <= lo * 1.5 then return (lo + hi) / 2, lo, hi end
+    end
+    local first = nums[1]
+    if first and first > 0 then return first, first, first end
+end
+
+local function SpellName(spellID)
+    if C_Spell and C_Spell.GetSpellName then return C_Spell.GetSpellName(spellID) end
+    return GetSpellInfo and (GetSpellInfo(spellID)) or tostring(spellID)
+end
+
+-- "Healing Wave (Rank 4)". Each rank is its own spell ID, so it's measured separately.
+local function SpellLabel(spellID)
+    local name = tostring(SpellName(spellID) or spellID)
+    local get = (C_Spell and C_Spell.GetSpellSubtext) or GetSpellSubtext
+    local rank = get and get(spellID)
+    if type(rank) == "string" and not issecretvalue(rank) and rank ~= "" then
+        return ("%s (%s)"):format(name, rank)
+    end
+    return name
+end
+
+local function IsGroupToken(u)
+    if u == "player" then return true end
+    if IsInRaid() then return u:find("^raid%d") ~= nil end
+    return u:find("^party%d") ~= nil
+end
+
+local function Readable(v, fallback)
+    if issecretvalue(v) then return "|cffff4040<hidden>|r" end
+    if v == nil then v = fallback end
+    return tostring(v)
+end
+
+local function Print(msg) print("|cff33ccffBetter Heal Bars|r " .. msg) end
 ns.Print = Print
+
+-- Tallies whether a group cast's end time is readable; /bhb casts prints it.
+local function CastTimeCheck(u)
+    local who = (u == "player") and "player" or "others"
+    if who == "others" then
+        -- Your own raid/party token would duplicate "player".
+        local same = UnitIsUnit(u, "player")
+        if not issecretvalue(same) and same then return end
+    end
+    local counts = ns.stats.castTimes[who]
+    local _, _, _, _, endMs = UnitCastingInfo(u)
+    local endText
+    if issecretvalue(endMs) then
+        counts.secret = counts.secret + 1
+        endText = "|cffff4040hidden by client|r"
+    elseif not endMs then
+        counts.missing = counts.missing + 1
+        endText = "|cffff4040no cast info|r"
+    else
+        counts.plain = counts.plain + 1
+        endText = ("|cff40ff40readable|r, lands in %.2fs"):format((endMs - GetTime() * 1000) / 1000)
+    end
+    if ns.castDebug then
+        print(("|cff33ccffBHB|r caster: %s (%s), spell: %s, end time: %s"):format(
+            Readable(UnitName(u), "?"), u, Readable(UnitCastingInfo(u), "?"), endText))
+    end
+end
+
+-------------------------------------------------------------------------------
+--  Measured heal sizes. The combat log is Blizzard-only here, but UNIT_COMBAT
+--  reports heals landing on you or your target with a readable amount and a
+--  crit flag (no caster); its amount includes overheal. A heal is matched to
+--  your cast that just succeeded, on the unit the cast was sent to. What's
+--  kept is heal / tooltip average, per spell ID (so per rank) and per tooltip
+--  range: the tooltip follows healing power, so any change (gear, buffs)
+--  starts a fresh measurement, and going back to a range reuses its own.
+-------------------------------------------------------------------------------
+local PRIOR_WEIGHT = 10    -- each tooltip starts at x1.00, worth this many heals (rolls are noisy)
+local MAX_WEIGHT = 30      -- the newest heal always counts at least 1/30
+local MAX_RANGES = 8       -- tooltip ranges kept per spell; the least recently used goes first
+local MATCH_WINDOW = 0.6   -- seconds between your cast succeeding and its heal landing
+local sentByGUID = {}      -- cast GUID -> name the cast was sent to (false: none)
+local sentCount = 0
+local lastSent             -- the last name sent, for casts without a readable GUID
+local pendingCast          -- { spell, tip, target, t }: succeeded, heal not seen yet
+local pendingHeal          -- { unit, name, amount, flag, t }: landed, cast not matched yet
+ns.healLog = false         -- /bhb combatlog prints every heal and what happened to it
+
+local function Round(x) return math.floor(x + 0.5) end
+
+-- The spell's tooltip right now: { base, lo, hi, key }, or nil without a heal amount.
+local function Tooltip(spellID)
+    local base, lo, hi = TooltipHealSize(spellID)
+    if not base or base <= 0 then return nil end
+    return { base = base, lo = lo, hi = hi, key = lo .. "-" .. hi }
+end
+
+-- For one spell and tooltip range: the ratio to use (heals blended with the
+-- x1.00 start), the heal count and the heals' own average; nil when unmeasured.
+local function Measured(spellID, key)
+    local byTip = healSizes[spellID]
+    local m = byTip and byTip[key]
+    if not m then return end
+    local w = math.min(m.n, MAX_WEIGHT)
+    return (m.ratio * w + PRIOR_WEIGHT) / (w + PRIOR_WEIGHT), m.n, m.ratio
+end
+
+local function AddSample(spellID, key, ratio)
+    local byTip = healSizes[spellID]
+    if not byTip then
+        byTip = {}
+        healSizes[spellID] = byTip
+    end
+    local m = byTip[key]
+    if not m then
+        local count, oldest = 0, nil
+        for k, v in pairs(byTip) do
+            count = count + 1
+            if not oldest or v.last < byTip[oldest].last then oldest = k end
+        end
+        if count >= MAX_RANGES then byTip[oldest] = nil end
+        m = { ratio = 0, n = 0 }
+        byTip[key] = m
+    end
+    m.n = m.n + 1
+    m.ratio = m.ratio + (ratio - m.ratio) / math.min(m.n, MAX_WEIGHT)
+    m.last = time()
+end
+
+-- The cast's target as sent ("Name", "Name Surname" or "Name-Realm") is this unit name.
+local function SameName(sent, name)
+    if not name then return false end
+    sent = sent:match("^[^-]+")
+    return sent == name or sent:sub(1, #name + 1) == name .. " "
+end
+
+-- Returns true when the heal was used, else false and why.
+local function TrySample(cast, heal)
+    if math.abs(heal.t - cast.t) > MATCH_WINDOW then return false, "no cast of yours just finished" end
+    if heal.flag == "CRITICAL" then return false, "crit" end
+    if cast.target then
+        if not SameName(cast.target, heal.name) then return false, "your cast was sent to " .. cast.target end
+    elseif heal.unit ~= "player" then
+        return false, "your cast's target is unknown"
+    end
+    local tip = cast.tip
+    if not tip then return false, "no heal amount in the tooltip" end
+    if heal.amount < tip.lo * 0.9 or heal.amount > tip.hi * 1.5 then
+        return false, ("outside the tooltip range %s"):format(tip.key)
+    end
+    AddSample(cast.spell, tip.key, heal.amount / tip.base)
+    return true
+end
+
+local function LogSample(heal, cast, used, why)
+    if not ns.healLog then return end
+    local verdict
+    if used then
+        local ratio, n, raw = Measured(cast.spell, cast.tip.key)
+        verdict = ("|cff40ff40used|r for %s at tooltip %s: heals land at x%.3f over %d; using x%.3f")
+            :format(SpellLabel(cast.spell), cast.tip.key, raw, n, ratio)
+    else
+        verdict = "|cffffd100not used|r: " .. why
+    end
+    print(("|cff33ccffBHB|r heal on %s: %d%s; %s"):format(heal.unit, heal.amount,
+        heal.flag == "CRITICAL" and " (crit)" or "", verdict))
+end
+
+local function OnHealLanded(unit, action, flag, amount)
+    if issecretvalue(action) or action ~= "HEAL" then return end
+    if issecretvalue(amount) or type(amount) ~= "number" or amount <= 0 or issecretvalue(flag) then
+        if ns.healLog then print("|cff33ccffBHB|r heal on " .. unit .. ": amount or flag |cffff4040hidden|r") end
+        return
+    end
+    local name = UnitName(unit)
+    local heal = { unit = unit, name = not issecretvalue(name) and name or nil, amount = amount, flag = flag,
+                   t = GetTime() }
+    if pendingCast and heal.t - pendingCast.t > MATCH_WINDOW then pendingCast = nil end
+    if pendingCast then
+        local cast = pendingCast
+        local used, why = TrySample(cast, heal)
+        if used then pendingCast = nil end
+        LogSample(heal, cast, used, why)
+    else
+        -- The heal can arrive just before your cast's "succeeded" event.
+        pendingHeal = heal
+        if ns.healLog then
+            print(("|cff33ccffBHB|r heal on %s: %d%s; waiting for a cast of yours to finish"):format(
+                unit, amount, flag == "CRITICAL" and " (crit)" or ""))
+        end
+    end
+end
+
+-- v when it's a readable, non-nil value, else nil.
+local function Plain(v)
+    if issecretvalue(v) then return nil end
+    return v
+end
+
+-- Whether a cast event's GUID is your current cast's (true when either is unknown).
+local function IsMyCast(castGUID)
+    castGUID = Plain(castGUID)
+    return not (myCast and myCast.guid and castGUID) or castGUID == myCast.guid
+end
+
+-- The name a cast was sent to: by its GUID when known, else the last one sent.
+local function SentTarget(castGUID)
+    local entry = sentByGUID[Plain(castGUID) or false]
+    if entry ~= nil then return entry or nil end
+    return lastSent or nil
+end
+
+local function OnCastSent(target, castGUID)
+    target = Plain(target)
+    if type(target) ~= "string" or target == "" then target = false end
+    lastSent = target
+    castGUID = Plain(castGUID)
+    if castGUID then
+        sentCount = sentCount + 1
+        if sentCount > 20 then wipe(sentByGUID); sentCount = 1 end
+        sentByGUID[castGUID] = target
+    end
+end
+
+local function OnCastSucceeded(castGUID, spellID)
+    local mine = myCast and IsMyCast(castGUID) and (myCast.guid or myCast.spell == Plain(spellID))
+    spellID = Plain(spellID) or (mine and myCast.spell)
+    if not spellID then return end
+    -- Your cast: the tooltip and target from when it started. Instants have no
+    -- start, so read them now.
+    local tip, target
+    if mine then
+        tip, target = myCast.tip, myCast.target
+    else
+        tip, target = Tooltip(spellID), SentTarget(castGUID)
+    end
+    local cast = { spell = spellID, tip = tip, target = target, t = GetTime() }
+    local heal = pendingHeal
+    pendingHeal = nil
+    if heal then
+        local used, why = TrySample(cast, heal)
+        LogSample(heal, cast, used, why)
+        if used then return end
+    end
+    pendingCast = cast
+end
+
+-------------------------------------------------------------------------------
+--  Your casts
+-------------------------------------------------------------------------------
+-- /bhb casts: what the overheal check will use for this cast of yours.
+local function CastDebug(c)
+    local cuts = {}
+    for _, scope in ipairs(ns.SCOPES) do
+        cuts[#cuts + 1] = c.size and OverhealCut(c.size, ns.GetSettings(scope).overhealThreshold) or "-"
+    end
+    print(("|cff33ccffBHB|r   your %s (%d): size %s from %s; cut Unit/Party/Raid %s"):format(
+        SpellLabel(c.spell), c.spell, c.size and Round(c.size) or "?", c.source, table.concat(cuts, "/")))
+    if c.tip then
+        local ratio, n, raw = Measured(c.spell, c.tip.key)
+        print(("    tooltip %s, average %d; measured %s"):format(c.tip.key, Round(c.tip.base),
+            ratio and ("x%.3f over %d heals, using x%.3f"):format(raw, n, ratio) or "none yet at this tooltip"))
+    end
+    print("    tooltip: " .. (SpellDescription(c.spell) or "|cffff4040none|r"))
+end
+
+local function OnCastStart(castGUID)
+    local _, _, _, _, _, _, castID, _, spellID = UnitCastingInfo("player")
+    spellID = Plain(spellID)
+    if not spellID then
+        myCast = nil
+        return
+    end
+    local guid = Plain(castGUID) or Plain(castID)
+    local tip = Tooltip(spellID)
+    myCast = { spell = spellID, guid = guid, tip = tip, target = SentTarget(guid) }
+    local ratio, n
+    if tip then ratio, n = Measured(spellID, tip.key) end
+    if ratio then
+        myCast.size, myCast.source = tip.base * ratio, ("tooltip x%.3f (%d heals measured)"):format(ratio, n)
+    elseif tip then
+        myCast.size, myCast.source = tip.base, "tooltip"
+    else
+        myCast.source = "unknown"
+    end
+    ns.stats.lastCast = myCast
+    if ns.castDebug then CastDebug(myCast) end
+    MarkAll()
+end
+
+-- Stop/fail/interrupt/succeed. Pressing another spell mid-cast fails that
+-- spell, not yours: only your cast's own GUID ends it, and without GUIDs a
+-- failure is ignored while you're still casting.
+local function OnCastEnd(event, castGUID)
+    if not myCast or not IsMyCast(castGUID) then return end
+    if not (myCast.guid and Plain(castGUID)) and event ~= "UNIT_SPELLCAST_STOP"
+       and Plain(UnitCastingInfo("player")) then
+        return
+    end
+    myCast = nil
+    MarkAll()
+end
+
+-- /bhb heals
+local function ListHeals()
+    local ids = {}
+    for id in pairs(healSizes) do ids[#ids + 1] = id end
+    if #ids == 0 then
+        Print("no heals measured yet. Heal yourself or your target (non-crits count).")
+        return
+    end
+    table.sort(ids, function(a, b) return SpellLabel(a) < SpellLabel(b) end)
+    Print("measured heals (real heal / tooltip average, per tooltip range; each starts at x1.00 worth "
+        .. PRIOR_WEIGHT .. " heals):")
+    for _, id in ipairs(ids) do
+        local now = Tooltip(id)
+        print(("  %s (%d):"):format(SpellLabel(id), id))
+        for key in pairs(healSizes[id]) do
+            local ratio, n, raw = Measured(id, key)
+            print(("    tooltip %s: x%.3f over %d heals, using x%.3f%s"):format(key, raw, n, ratio,
+                (now and now.key == key) and (" |cff40ff40(current, size %d)|r"):format(Round(now.base * ratio)) or ""))
+        end
+    end
+end
 
 local function WarnBuiltIn()
     local on = ns.BuiltInPredictionScopes()
@@ -575,10 +1018,36 @@ local UNIT_EVENTS = {
     UNIT_HEAL_PREDICTION = true, UNIT_HEALTH = true, UNIT_MAXHEALTH = true,
     UNIT_HEAL_ABSORB_AMOUNT_CHANGED = true,
 }
+local CAST_START = { UNIT_SPELLCAST_START = true, UNIT_SPELLCAST_DELAYED = true }
+local CAST_END = {
+    UNIT_SPELLCAST_STOP = true, UNIT_SPELLCAST_FAILED = true,
+    UNIT_SPELLCAST_INTERRUPTED = true, UNIT_SPELLCAST_SUCCEEDED = true,
+}
 
-events:SetScript("OnEvent", function(_, event, arg1)
+events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
     if UNIT_EVENTS[event] then
         MarkUnit(arg1)
+    elseif event == "UNIT_COMBAT" then
+        OnHealLanded(arg1, arg2, arg3, arg4)
+    elseif event == "UNIT_SPELLCAST_SENT" then
+        -- unit, target, castGUID, spellID
+        if arg1 == "player" then OnCastSent(arg2, arg3) end
+    elseif CAST_START[event] or CAST_END[event] then
+        -- unit, castGUID, spellID
+        if not (arg1 and IsGroupToken(arg1)) then return end
+        if CAST_START[event] then CastTimeCheck(arg1) end
+        if arg1 == "player" then
+            if CAST_START[event] then
+                OnCastStart(arg2)
+            else
+                if event == "UNIT_SPELLCAST_SUCCEEDED" then OnCastSucceeded(arg2, arg3) end
+                OnCastEnd(event, arg2)
+            end
+        end
+    elseif event == "PLAYER_TARGET_CHANGED" or event == "PLAYER_FOCUS_CHANGED" then
+        -- Same token, new unit (which may now also be you).
+        mapDirty = true
+        MarkUnit(event == "PLAYER_TARGET_CHANGED" and "target" or "focus")
     elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
         RebuildRoster()
         Scan()
@@ -592,8 +1061,19 @@ events:SetScript("OnEvent", function(_, event, arg1)
             return
         end
         for e in pairs(UNIT_EVENTS) do events:RegisterEvent(e) end
+        for e in pairs(CAST_START) do events:RegisterEvent(e) end
+        for e in pairs(CAST_END) do events:RegisterEvent(e) end
+        events:RegisterEvent("UNIT_SPELLCAST_SENT")
+        events:RegisterUnitEvent("UNIT_COMBAT", "player", "target")
+        local guid = UnitGUID("player")
+        if guid and not issecretvalue(guid) then
+            ns.db.healSizes[guid] = ns.db.healSizes[guid] or {}
+            healSizes = ns.db.healSizes[guid]
+        end
         events:RegisterEvent("GROUP_ROSTER_UPDATE")
         events:RegisterEvent("PLAYER_ENTERING_WORLD")
+        events:RegisterEvent("PLAYER_TARGET_CHANGED")
+        pcall(events.RegisterEvent, events, "PLAYER_FOCUS_CHANGED")   -- not on every client
         if ns.InitOptions then ns.InitOptions() end
         playerClass = select(2, UnitClass("player"))
         RebuildRoster()
@@ -617,15 +1097,45 @@ local function Status()
     print("  Party & raid shared: " .. tostring(ns.db.sharePartyRaid))
     print("  Last heal amounts secret: " .. tostring(ns.stats.secretAmounts))
     print("  Group healers with class-colored bars: " .. (#roster / 2))
+    -- Which unit tokens repaint each unit frame (target/focus also list their group token).
+    if mapDirty then RebuildMap() end
+    for _, uf in ipairs(UNIT_FRAMES) do
+        local rec = records[_G[uf.global] or false]
+        if rec then
+            local tokens = {}
+            for u, l in pairs(unitMap) do
+                for i = 1, #l do
+                    if l[i] == rec then tokens[#tokens + 1] = u; break end
+                end
+            end
+            table.sort(tokens)
+            print(("  %s frame updates from: %s"):format(uf.label,
+                #tokens > 0 and table.concat(tokens, ", ") or "nothing (hidden or no unit)"))
+        end
+    end
+    print("  Cast end times:")
+    for _, who in ipairs({ "player", "others" }) do
+        local t = ns.stats.castTimes[who]
+        print(("    %s: |cff40ff40%d plain|r, |cffff4040%d secret|r, %d no cast info")
+            :format(who == "player" and "You" or "Group", t.plain, t.secret, t.missing))
+    end
+    local measured = 0
+    for _ in pairs(healSizes) do measured = measured + 1 end
+    print("  Spells with measured heals: " .. measured .. " (/bhb heals lists them)")
+    local c = ns.stats.lastCast
+    if c then
+        print(("  Last cast: %s (%d), size %s from %s"):format(SpellLabel(c.spell), c.spell,
+            c.size and Round(c.size) or "?", c.source))
+    end
     print("  Test mode: " .. tostring(ns.testMode))
     local on = ns.BuiltInPredictionScopes()
     if #on > 0 then print("  |cffffd100EllesmereUI heal prediction still on:|r " .. table.concat(on, ", ")) end
     if ns.stats.lastError then print("  Last error: " .. ns.stats.lastError) end
 end
 
-SLASH_FOREVERHEALPREDICT1 = "/fhp"
-SLASH_FOREVERHEALPREDICT2 = "/foreverhealpredict"
-SlashCmdList.FOREVERHEALPREDICT = function(msg)
+SLASH_BETTERHEALBARS1 = "/bhb"
+SLASH_BETTERHEALBARS2 = "/betterhealbars"
+SlashCmdList.BETTERHEALBARS = function(msg)
     msg = (msg or ""):lower():match("^%s*(.-)%s*$")
     if msg == "test" then
         ns.testMode = not ns.testMode
@@ -633,6 +1143,24 @@ SlashCmdList.FOREVERHEALPREDICT = function(msg)
         MarkAll()
     elseif msg == "status" then
         Status()
+    elseif msg == "casts" then
+        ns.castDebug = not ns.castDebug
+        Print("cast debug " .. (ns.castDebug
+            and "on: every group cast start shows whether its end time is readable; yours also show what the overheal check uses"
+            or "off"))
+    elseif msg == "resetstats" then
+        for _, t in pairs(ns.stats.castTimes) do t.plain, t.secret, t.missing = 0, 0, 0 end
+        Print("cast statistics reset")
+    elseif msg == "combatlog" then
+        ns.healLog = not ns.healLog
+        Print("heal log " .. (ns.healLog
+            and "on: each heal on you or your target shows whether it was used to measure your heal size"
+            or "off"))
+    elseif msg == "heals" then
+        ListHeals()
+    elseif msg == "resetheals" then
+        wipe(healSizes)
+        Print("measured heal sizes cleared; tooltip averages are used until new heals are measured.")
     elseif msg == "rescan" then
         Scan()
         MarkAll()

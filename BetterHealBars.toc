@@ -1,13 +1,13 @@
 ## Interface: 16001
 ## AllowLoadGameType: camelot
-## Title: Forever HealPredict |cff0cd29f(EllesmereUI)|r
-## Notes: Incoming heal prediction for EllesmereUI player, party and raid frames on WoW Forever.
+## Title: Better Heal Bars |cff0cd29f(EllesmereUI)|r
+## Notes: Incoming heal prediction for EllesmereUI player, target, focus, party and raid frames on WoW Forever.
 ## Author: jmeier5261
 ## Version: 1.0.0
 ## X-License: GPL-3.0
 ## Dependencies: EllesmereUI
 ## OptionalDeps: EllesmereUIRaidFrames, EllesmereUIUnitFrames
-## SavedVariables: ForeverHealPredictDB
+## SavedVariables: BetterHealBarsDB
 
 Settings.lua
 Core.lua
