@@ -1,11 +1,11 @@
-# Forever HealPredict (EllesmereUI)
+# Better Heal Bars (EllesmereUI)
 
 Incoming-heal bars for **EllesmereUI** frames on **WoW Forever** (client interface 16001, game type `camelot`).
 
 - Raid frames and party frames come from `EllesmereUIRaidFrames`.
 - The player, target and focus frames come from `EllesmereUIUnitFrames` (`EllesmereUIUnitFrames_Player`, `_Target`, `_Focus`).
 
-Install by copying the `ForeverHealPredict` folder into `_classic_beta_/Interface/AddOns/` (or the live Forever client's AddOns folder). Turn off EllesmereUI's own **Heal Prediction** option for raid, party, player, target and focus frames, or you'll see two sets of bars. The addon warns at login when it's still on.
+Install by copying the `BetterHealBars` folder into `_classic_beta_/Interface/AddOns/` (or the live Forever client's AddOns folder). Turn off EllesmereUI's own **Heal Prediction** option for raid, party, player, target and focus frames, or you'll see two sets of bars. The addon warns at login when it's still on.
 
 ## Features
 
@@ -23,16 +23,17 @@ Each feature can be set separately for Unit, Party and Raid frames. The Unit tab
 
 Slash commands:
 
-- `/fhp` opens the options.
-- `/fhp test` turns fake test bars on or off.
-- `/fhp status` prints diagnostics.
-- `/fhp casts` turns cast debug on or off. Every group cast start prints the caster, spell and whether its end time is readable. Your casts also print the spell and rank, the heal size used and where it came from, the overheal cut-off per tab, the tooltip and measured averages, and the spell's tooltip text.
-- `/fhp resetstats` clears the cast end time counts shown by `/fhp status`.
-- `/fhp combatlog` turns the heal log on or off: each heal landing on you or your target prints its amount and whether it was used to measure your heal size, or why not.
-- `/fhp heals` lists, per spell, rank and tooltip range, how your real heals compare to the tooltip average, marking the current range with the size it gives.
-- `/fhp resetheals` clears the measurements.
-- `/fhp rescan` finds frames again.
+- `/bhb` opens the options.
+- `/bhb test` turns fake test bars on or off.
+- `/bhb status` prints diagnostics.
+- `/bhb casts` turns cast debug on or off. Every group cast start prints the caster, spell and whether its end time is readable. Your casts also print the spell and rank, the heal size used and where it came from, the overheal cut-off per tab, the tooltip and measured averages, and the spell's tooltip text.
+- `/bhb resetstats` clears the cast end time counts shown by `/bhb status`.
+- `/bhb combatlog` turns the heal log on or off: each heal landing on you or your target prints its amount and whether it was used to measure your heal size, or why not.
+- `/bhb heals` lists, per spell, rank and tooltip range, how your real heals compare to the tooltip average, marking the current range with the size it gives.
+- `/bhb resetheals` clears the measurements.
+- `/bhb rescan` finds frames again.
 
+## How it works
 
 - **My / other split.** `GetIncomingHeals()` returns the total, the amount from the player, and the amount from everyone else.
 - **Overflow.** The calculator's `SetIncomingHealOverflowPercent(1 + pct)` clamps the amounts. A clipping frame limits how far the bars can draw past the bar end.
@@ -43,7 +44,7 @@ Slash commands:
 ### Limits
 
 - **No HoT prediction or per-spell detail.** The client API only reports what Blizzard's prediction covers.
-- **Heal size is an average.** Each heal's roll can't be known until it lands, and crits aren't counted. Heals are only measured on you and your target, so a spell you only cast on others keeps its tooltip average (English tooltips only). Heals from others landing first and heal absorbs on the target aren't taken into account.
+- **Heal size is an average.** Each heal's roll can't be known until it lands, and crits aren't counted. Heals are only measured on you and your target, so a spell you only cast on others keeps its tooltip average. The tooltip is read by its numbers only, so it works in any client language; spells that show a single amount instead of a range use the first number in the text, which is less reliable. Heals from others landing first and heal absorbs on the target aren't taken into account.
 - **Healing reduction on the target isn't scaled.** The cut-off comes from your unmodified heal size. A heal that fits is never flagged, but with a debuff such as Mortal Strike on the target, any overheal can be flagged, not just overheal at or above the threshold.
 
 ## License

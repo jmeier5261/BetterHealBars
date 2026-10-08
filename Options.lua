@@ -1,7 +1,7 @@
 -------------------------------------------------------------------------------
 --  Options.lua
---  Settings panel (Game Menu > Options > AddOns > Forever HealPredict, or /fhp)
---  One page with Player / Party / Raid tabs; every control edits the tab's
+--  Settings panel (Game Menu > Options > AddOns > Better Heal Bars, or /bhb)
+--  One page with Unit / Party / Raid tabs; every control edits the tab's
 --  effective settings (party edits raid's while "share" is on).
 --
 --  Copyright (C) 2026 jmeier5261
@@ -261,11 +261,11 @@ end
 local function Build()
     panel = CreateFrame("Frame")
     panel:Hide()
-    panel.name = "Forever HealPredict"
+    panel.name = "Better Heal Bars"
 
     local title = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
     title:SetPoint("TOPLEFT", 16, -16)
-    title:SetText("Forever HealPredict")
+    title:SetText("Better Heal Bars")
     Note(panel, "Incoming heal prediction for EllesmereUI player, party and raid frames.", 16, -38, 560)
 
     -- Scope tabs + share toggle
@@ -378,7 +378,7 @@ local function Build()
     end)
     local test = Button(panel, "Toggle test bars", 130)
     test:SetPoint("LEFT", reset, "RIGHT", 8, 0)
-    test:SetScript("OnClick", function() SlashCmdList.FOREVERHEALPREDICT("test") end)
+    test:SetScript("OnClick", function() SlashCmdList.BETTERHEALBARS("test") end)
     Note(panel, "Test bars draw fake heals on every frame; alternate frames show the overheal color, "
         .. "and with class colors on, part of the other players' bar shows a sample healer class. "
         .. "Units at full health only show them inside the overflow area.", L, -446, 560)

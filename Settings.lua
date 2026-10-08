@@ -1,6 +1,6 @@
 -------------------------------------------------------------------------------
 --  Settings.lua
---  Saved variables, defaults, per-scope resolution (player / party / raid),
+--  Saved variables, defaults, per-scope resolution (unit / party / raid),
 --  the party+raid share toggle and copy between scopes.
 --
 --  Copyright (C) 2026 jmeier5261
@@ -67,20 +67,15 @@ local function FillMissing(dst, defaults)
 end
 
 function ns.InitDB()
-    ForeverHealPredictDB = ForeverHealPredictDB or {}
-    local db = ForeverHealPredictDB
+    BetterHealBarsDB = BetterHealBarsDB or {}
+    local db = BetterHealBarsDB
     db.version = 1
     if db.sharePartyRaid == nil then db.sharePartyRaid = false end
     db.healSizes = db.healSizes or {}   -- player GUID -> { spellID -> { "lo-hi" tooltip -> { ratio, n, last } } }
     db.scopes = db.scopes or {}
-    -- The Player tab became the Unit tab (player, target and focus frames).
-    if db.scopes.player and not db.scopes.unit then db.scopes.unit = db.scopes.player end
-    db.scopes.player = nil
     for _, scope in ipairs(ns.SCOPES) do
         db.scopes[scope] = db.scopes[scope] or {}
         FillMissing(db.scopes[scope], ns.DEFAULTS[scope])
-        -- Removed options.
-        db.scopes[scope].overhealOthers, db.scopes[scope].otherOverhealColor = nil, nil
     end
     ns.db = db
 end
