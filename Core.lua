@@ -382,7 +382,9 @@ end
 -------------------------------------------------------------------------------
 local function UnitOf(rec)
     if rec.kind == "rf" then return rec.owner:GetAttribute("unit") end
-    return rec.owner.unit or "player"
+    -- EllesmereUI unit frames never carry a .unit field (it taints pings);
+    -- _euiUnit is the live token, vehicle swaps included.
+    return rec.owner._euiUnit or rec.owner:GetAttribute("unit")
 end
 
 local function AddToMap(u, rec)
@@ -508,14 +510,12 @@ local function BuildRecord(owner, health, kind, scope)
     rec.testIndex = #recList
     HookHealth(rec, health)
 
-    if kind == "rf" then
-        owner:HookScript("OnAttributeChanged", function(_, name)
-            if name == "unit" then
-                mapDirty = true
-                MarkDirty(rec)
-            end
-        end)
-    end
+    owner:HookScript("OnAttributeChanged", function(_, name)
+        if name == "unit" or name == "toggleForVehicle" then
+            mapDirty = true
+            MarkDirty(rec)
+        end
+    end)
     owner:HookScript("OnShow", function() mapDirty = true; MarkDirty(rec) end)
     owner:HookScript("OnHide", function() mapDirty = true end)
     return rec
