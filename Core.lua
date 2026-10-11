@@ -142,7 +142,9 @@ local function PlaceBar(bar, target, pts, near, vert, rev, w, h, tex)
 end
 
 -- Anchors only; skipped when nothing that affects geometry has changed.
-local function Layout(rec, S, nS)
+-- mod: healing taken multiplier. A StatusBar's fill is value / max of its
+-- length, so bars mod times as long show every (secret) amount times mod.
+local function Layout(rec, S, nS, mod)
     local health = rec.health
     local fill = health:GetStatusBarTexture()
     if not fill then return false end
@@ -167,10 +169,16 @@ local function Layout(rec, S, nS)
 
     local L = rec.L
     if L.fill == fill and L.dir == dir and L.inv == inv and L.w == w and L.h == h
-       and L.ext == ext and L.nS == nS and L.tex == tex and L.gen == ns.settingsGen then
+       and L.ext == ext and L.nS == nS and L.tex == tex and L.mod == mod and L.gen == ns.settingsGen then
         return true
     end
-    L.fill, L.dir, L.inv, L.w, L.h, L.ext, L.nS, L.tex, L.gen = fill, dir, inv, w, h, ext, nS, tex, ns.settingsGen
+    L.fill, L.dir, L.inv, L.w, L.h, L.ext, L.nS, L.tex, L.mod, L.gen =
+        fill, dir, inv, w, h, ext, nS, tex, mod, ns.settingsGen
+    -- The bars' own length; the holder below still clips at the real bar end.
+    local bw, bh = w, h
+    if mod < 1 then
+        if vert then bh = h * math.max(mod, 0.01) else bw = w * math.max(mod, 0.01) end
+    end
 
     -- Holder = health bar rect plus the overflow allowance; it clips everything.
     local holder = rec.holder
@@ -188,7 +196,7 @@ local function Layout(rec, S, nS)
     -- Chain: [your heals] -> [one bar per group healer (class colors)]
     local prev, prevPts = fill, seamPts
     if S.showMine then
-        PlaceBar(rec.mine, prev, prevPts, near, vert, rev, w, h, tex)
+        PlaceBar(rec.mine, prev, prevPts, near, vert, rev, bw, bh, tex)
         rec.mine:Show()
         local mineFill = rec.mine:GetStatusBarTexture()
         prev, prevPts = mineFill, far
@@ -222,7 +230,7 @@ local function Layout(rec, S, nS)
             seg = NewBar(holder)
             rec.segs[i] = seg
         end
-        PlaceBar(seg, prev, prevPts, near, vert, rev, w, h, tex)
+        PlaceBar(seg, prev, prevPts, near, vert, rev, bw, bh, tex)
         seg:Show()
         prev, prevPts = seg:GetStatusBarTexture(), far
     end
@@ -236,13 +244,76 @@ local function Layout(rec, S, nS)
         ac:ClearAllPoints()
         ac:SetPoint(near[1], prev, prevPts[1], 0, 0)
         ac:SetPoint(FAR_CORNER[dir], holder, FAR_CORNER[dir], 0, 0)
-        PlaceBar(rec.rest, fill, seamPts, near, vert, rev, w, h, tex)
+        PlaceBar(rec.rest, fill, seamPts, near, vert, rev, bw, bh, tex)
         ac:Show()
         rec.rest:Show()
     else
         ac:Hide()
     end
     return true
+end
+
+-------------------------------------------------------------------------------
+--  Healing reduction: known debuffs (HealCuts.lua) on friendly units. The
+--  heal prediction API leaves them out. A hidden spell ID just doesn't count.
+-------------------------------------------------------------------------------
+local cutCache = {}   -- unit token -> healing taken multiplier (1 = none)
+local cutBest = {}    -- scratch: group -> strongest pct
+
+local function ScanHealCuts(unit)
+    local hostile = UnitCanAttack("player", unit)
+    if not issecretvalue(hostile) and hostile then return 1 end
+    wipe(cutBest)
+    for i = 1, 40 do
+        local a = C_UnitAuras.GetAuraDataByIndex(unit, i, "HARMFUL")
+        if not a then break end
+        local id = a.spellId
+        local cut = not issecretvalue(id) and ns.HEAL_CUTS[id]
+        if cut and (cutBest[cut.group] or 0) < cut.pct then cutBest[cut.group] = cut.pct end
+    end
+    local mod = 1
+    for _, pct in pairs(cutBest) do mod = mod * (1 - pct / 100) end
+    return mod
+end
+
+local function UnitHealMod(unit)
+    local m = cutCache[unit]
+    if m == nil then
+        local ok, v = pcall(ScanHealCuts, unit)
+        m = ok and v or 1
+        cutCache[unit] = m
+    end
+    return m
+end
+
+local function CutPercent(mod) return math.floor((1 - mod) * 100 + 0.5) end
+
+-- The "-50%" text over the health bar.
+local function PaintCut(rec, S, mod)
+    local f = rec.cutFrame
+    if not S.healCutText or mod >= 1 then
+        f:Hide()
+        return
+    end
+    local health = rec.health
+    local point = S.healCutTextPoint or "TOPRIGHT"
+    local size = math.max(8, math.min(14, math.floor(health:GetHeight() * 0.5)))
+    local fs = rec.cutText
+    if f._health ~= health or f._point ~= point or f._size ~= size then
+        f._health, f._point, f._size = health, point, size
+        f:ClearAllPoints()
+        f:SetAllPoints(health)
+        f:SetFrameLevel(health:GetFrameLevel() + 5)
+        fs:SetFont(STANDARD_TEXT_FONT, size, "OUTLINE")
+        fs:ClearAllPoints()
+        local x = point:find("LEFT") and 2 or point:find("RIGHT") and -2 or 0
+        local y = point:find("TOP") and -1 or point:find("BOTTOM") and 1 or 0
+        fs:SetPoint(point, f, point, x, y)
+    end
+    local c = S.healCutColor
+    fs:SetTextColor(c.r, c.g, c.b, c.a or 1)
+    fs:SetText(("-%d%%"):format(CutPercent(mod)))
+    f:Show()
 end
 
 -- Most of your heal that can land and still count as wasting >= pct% (and >= 1).
@@ -257,11 +328,20 @@ end
 local function Paint(rec)
     local S = ns.GetSettings(rec.scope)
     local unit = rec.unit
-    if not (S.showMine or S.showOthers) or (rec.toggle and not S[rec.toggle])
-       or not unit or not rec.owner:IsVisible() or not UnitExists(unit) then
+    if (rec.toggle and not S[rec.toggle]) or not unit or not rec.owner:IsVisible() or not UnitExists(unit) then
+        rec.holder:Hide()
+        rec.cutFrame:Hide()
+        return
+    end
+    rec.mod = UnitHealMod(unit)
+    local mod = rec.mod
+    if ns.testMode then mod = (rec.testIndex % 3 == 0) and 0.5 or 1 end
+    PaintCut(rec, S, mod)
+    if not (S.showMine or S.showOthers) then
         rec.holder:Hide()
         return
     end
+    local barMod = S.healCutScale and mod or 1
 
     local total, mine, others, maxHP, over
     local mineFit, useFlag   -- mineFit may be SECRET; useFlag is the plain "have it" flag
@@ -279,7 +359,12 @@ local function Paint(rec)
         end
         over = (rec.testIndex % 2 == 0)
     else
-        local overflow = S.overflowEnabled and (1 + (S.overflowPct or 0) / 100) or 1
+        local p = S.overflowEnabled and (S.overflowPct or 0) / 100 or 0
+        local overflow = 1 + p
+        -- Shrunk bars: the calculator caps amounts before they're shrunk, so
+        -- loosen its cap until mod x cap >= missing + overflow for any missing
+        -- health; the holder still clips at the real limit.
+        if barMod < 1 then overflow = 1 + ((1 - barMod) + p) / math.max(barMod, 0.01) end
         calc:SetIncomingHealOverflowPercent(overflow)
         UnitGetDetailedHealPrediction(unit, "player", calc)
         total, mine, others = calc:GetIncomingHeals()
@@ -311,7 +396,7 @@ local function Paint(rec)
         rec.holder:Hide()
         return
     end
-    if not Layout(rec, S, nS) then
+    if not Layout(rec, S, nS, barMod) then
         rec.holder:Hide()
         return
     end
@@ -330,7 +415,8 @@ local function Paint(rec)
             -- Wasted >= threshold (and >= 1) <=> lands <= cut. Over the range
             -- [cut, cut + 1] the bar clamps whole amounts to empty (flagged)
             -- or full (not), so flagRest shows over all of your fill or none.
-            local cut = OverhealCut(myCast.size, S.overhealThreshold)
+            -- The heal is what lands after the unit's healing reduction.
+            local cut = OverhealCut(myCast.size * mod, S.overhealThreshold)
             local fb = rec.flagBar
             fb:SetMinMaxValues(cut, cut + 1)
             fb:SetValue(mineFit)
@@ -459,6 +545,20 @@ local function MarkUnit(unit)
     driver:Show()
 end
 
+-- Debuffs changed: re-read the healing reduction of every frame showing this
+-- unit (target / focus included), repainting only those whose value changed.
+local function OnAura(unit)
+    cutCache[unit] = nil
+    if mapDirty then RebuildMap() end
+    local l = unitMap[unit]
+    if not l then return end
+    for i = 1, #l do
+        local rec = l[i]
+        cutCache[rec.unit] = nil
+        if UnitHealMod(rec.unit) ~= rec.mod then MarkDirty(rec) end
+    end
+end
+
 local function MarkAll()
     mapDirty = true
     allDirty = true
@@ -504,6 +604,10 @@ local function BuildRecord(owner, health, kind, scope)
     rec.flagBar = NewBar(holder)
     rec.flagBar:Hide()
     rec.flagRest = rec.flagBar:CreateTexture(nil, "ARTWORK")
+    -- Healing reduction text: its own frame, since the holder clips and hides.
+    rec.cutFrame = CreateFrame("Frame", nil, owner)
+    rec.cutFrame:Hide()
+    rec.cutText = rec.cutFrame:CreateFontString(nil, "OVERLAY")
 
     records[owner] = rec
     recList[#recList + 1] = rec
@@ -814,6 +918,7 @@ end
 local function TrySample(cast, heal)
     if math.abs(heal.t - cast.t) > MATCH_WINDOW then return false, "no cast of yours just finished" end
     if heal.flag == "CRITICAL" then return false, "crit" end
+    if heal.mod < 1 then return false, ("-%d%% healing reduction on %s"):format(CutPercent(heal.mod), heal.unit) end
     if cast.target then
         if not SameName(cast.target, heal.name) then return false, "your cast was sent to " .. cast.target end
     elseif heal.unit ~= "player" then
@@ -850,7 +955,7 @@ local function OnHealLanded(unit, action, flag, amount)
     end
     local name = UnitName(unit)
     local heal = { unit = unit, name = not issecretvalue(name) and name or nil, amount = amount, flag = flag,
-                   t = GetTime() }
+                   mod = UnitHealMod(unit), t = GetTime() }
     if pendingCast and heal.t - pendingCast.t > MATCH_WINDOW then pendingCast = nil end
     if pendingCast then
         local cast = pendingCast
@@ -1027,6 +1132,8 @@ local CAST_END = {
 events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
     if UNIT_EVENTS[event] then
         MarkUnit(arg1)
+    elseif event == "UNIT_AURA" then
+        OnAura(arg1)
     elseif event == "UNIT_COMBAT" then
         OnHealLanded(arg1, arg2, arg3, arg4)
     elseif event == "UNIT_SPELLCAST_SENT" then
@@ -1046,9 +1153,12 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         end
     elseif event == "PLAYER_TARGET_CHANGED" or event == "PLAYER_FOCUS_CHANGED" then
         -- Same token, new unit (which may now also be you).
+        local token = event == "PLAYER_TARGET_CHANGED" and "target" or "focus"
+        cutCache[token] = nil
         mapDirty = true
-        MarkUnit(event == "PLAYER_TARGET_CHANGED" and "target" or "focus")
+        MarkUnit(token)
     elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
+        wipe(cutCache)
         RebuildRoster()
         Scan()
         MarkAll()
@@ -1064,6 +1174,7 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         for e in pairs(CAST_START) do events:RegisterEvent(e) end
         for e in pairs(CAST_END) do events:RegisterEvent(e) end
         events:RegisterEvent("UNIT_SPELLCAST_SENT")
+        events:RegisterEvent("UNIT_AURA")
         events:RegisterUnitEvent("UNIT_COMBAT", "player", "target")
         local guid = UnitGUID("player")
         if guid and not issecretvalue(guid) then
@@ -1133,6 +1244,234 @@ local function Status()
     if ns.stats.lastError then print("  Last error: " .. ns.stats.lastError) end
 end
 
+-- /bhb auras [unit]: the unit's debuffs and which of their fields this client hides.
+local AURA_FIELDS = { "name", "spellId", "applications", "dispelName", "sourceUnit", "auraInstanceID", "duration", "points" }
+
+local function DumpAuras(unit)
+    if unit == "" then unit = "target" end
+    if not (C_UnitAuras and C_UnitAuras.GetAuraDataByIndex) then
+        Print("|cffff4040this client has no C_UnitAuras.GetAuraDataByIndex.|r")
+        return
+    end
+    if not UnitExists(unit) then
+        Print("no unit " .. unit)
+        return
+    end
+    -- Heal cuts only matter on units you can heal.
+    local friend = UnitIsFriend("player", unit)
+    if not issecretvalue(friend) and not friend then
+        Print(unit .. " isn't friendly; target a group member or use a token such as party1.")
+        return
+    end
+    Print(("debuffs on %s (%s), you are %s"):format(unit, Readable(UnitName(unit), "?"),
+        InCombatLockdown() and "|cffff4040in combat|r" or "|cff40ff40out of combat|r"))
+    local hidden, n = {}, 0
+    for i = 1, 40 do
+        local a = C_UnitAuras.GetAuraDataByIndex(unit, i, "HARMFUL")
+        if not a then break end
+        n = i
+        for _, f in ipairs(AURA_FIELDS) do
+            if issecretvalue(a[f]) then hidden[f] = true end
+        end
+        local pts, ptsText = a.points, "none"
+        if issecretvalue(pts) then
+            ptsText = Readable(pts)
+        elseif type(pts) == "table" and #pts > 0 then
+            local t = {}
+            for j = 1, #pts do
+                if issecretvalue(pts[j]) then hidden.points = true end
+                t[j] = Readable(pts[j])
+            end
+            ptsText = table.concat(t, ", ")
+        end
+        local cut = not issecretvalue(a.spellId) and ns.HEAL_CUTS[a.spellId]
+        print(("  %d %s (%s) x%s, %s, from %s, instance %s, %ss, points: %s%s"):format(i,
+            Readable(a.name, "?"), Readable(a.spellId, "?"), Readable(a.applications, 0),
+            Readable(a.dispelName, "no type"), Readable(a.sourceUnit, "?"), Readable(a.auraInstanceID, "?"),
+            Readable(a.duration, "?"), ptsText,
+            cut and (" |cffff4040[heal cut -%d%%, %s]|r"):format(cut.pct, cut.group) or ""))
+    end
+    if n == 0 then print("  no debuffs") return end
+    cutCache[unit] = nil
+    local mod = UnitHealMod(unit)
+    print("  Healing reduction counted: " .. (mod < 1 and ("|cffff4040-%d%%|r"):format(CutPercent(mod)) or "none"))
+    local list = {}
+    for _, f in ipairs(AURA_FIELDS) do
+        if hidden[f] then list[#list + 1] = f end
+    end
+    print("  Hidden fields: " .. (#list > 0 and ("|cffff4040" .. table.concat(list, ", ") .. "|r") or "|cff40ff40none|r"))
+    print("  Lookup by name (C_UnitAuras.GetAuraDataBySpellName): "
+        .. (C_UnitAuras.GetAuraDataBySpellName and "available" or "|cffff4040missing|r"))
+end
+
+-------------------------------------------------------------------------------
+--  /bhb scan: walks spell IDs for descriptions that read like healing
+--  reduction and saves them to BetterHealBarsDB.healCutScan, each with a line
+--  ready for HealCuts.lua. English descriptions only; review before using.
+-------------------------------------------------------------------------------
+local SCAN_DEFAULT_MAX = 60000
+local SCAN_BUDGET_MS = 8   -- per frame
+-- A sentence counts when it has one of these (lowercase Lua patterns)...
+local SCAN_HEAL_PHRASES = {
+    "healing effects", "healing received", "healing taken", "heals received",
+    "effectiveness of [%a%s]-heal", "healing done to", "reduc%a* healing by",
+}
+-- ...and one of these.
+local SCAN_LESS_WORDS = { "reduc", "decreas", "lower", "less" }
+local scanState
+
+local function HasAny(s, patterns)
+    for i = 1, #patterns do
+        if s:find(patterns[i]) then return true end
+    end
+    return false
+end
+
+-- The first sentence of the text that reads like healing reduction, or nil.
+local function HealCutSentence(text)
+    text = text:lower():gsub("[\r\n]+", ". ")
+    for s in (text .. ". "):gmatch("(.-)%.%s+") do
+        if HasAny(s, SCAN_HEAL_PHRASES) and HasAny(s, SCAN_LESS_WORDS) then return s end
+    end
+end
+
+-- Returns false when the spell has no description to read (yet).
+local function CheckDescription(st, id, name)
+    local text = SpellDescription(id)
+    if not text or text == "" then return false end
+    st.described = st.described + 1
+    local s = HealCutSentence(text)
+    if not s then return true end
+    -- The amount follows the healing part ("...any healing by 50%"); numbers
+    -- before it are other effects (weapon damage, proc chance).
+    local amount, isPct = s:match("heal.-by (%d+)(%%?)")
+    amount = tonumber(amount)
+    local pct = isPct == "%" and amount or nil
+    local label = SpellLabel(id)
+    st.results[#st.results + 1] = {
+        id = id, name = label, pct = pct, text = text,
+        flat = not pct and amount or nil,
+        listed = ns.HEAL_CUTS[id] and true or nil,
+        line = pct and ("[%d] = { pct = %d, group = %q }, -- %s"):format(id, pct, name:lower(), label) or nil,
+    }
+    return true
+end
+
+local function ScanOne(st, id)
+    local name = C_Spell.GetSpellName(id)
+    if not name or issecretvalue(name) then return end
+    st.found, st.highest = st.found + 1, id
+    if CheckDescription(st, id, name) then return end
+    -- The client loads spell text on demand: ask for it, and SPELL_DATA_LOAD_RESULT
+    -- reads it again. Already loaded with no text: nothing to wait for.
+    local cached = C_Spell.IsSpellDataCached and C_Spell.IsSpellDataCached(id)
+    if C_Spell.RequestLoadSpellData and not (not issecretvalue(cached) and cached) then
+        st.pending[id] = name
+        st.pendingCount = st.pendingCount + 1
+        C_Spell.RequestLoadSpellData(id)
+    end
+end
+
+local SCAN_LOAD_WAIT = 5   -- seconds without a load result before giving up on the rest
+
+local scanFrame = CreateFrame("Frame")
+scanFrame:Hide()
+
+scanFrame:SetScript("OnEvent", function(_, _, id, success)
+    local st = scanState
+    local name = st and st.pending[id]
+    if not name then return end
+    st.pending[id] = nil
+    st.pendingCount = st.pendingCount - 1
+    st.lastLoad = GetTime()
+    if success then
+        st.loaded = st.loaded + 1
+        pcall(CheckDescription, st, id, name)
+    end
+end)
+
+local function FinishScan(stopped)
+    scanFrame:Hide()
+    scanFrame:UnregisterAllEvents()
+    local st = scanState
+    scanState = nil
+    local results = st.results
+    table.sort(results, function(a, b) return a.id < b.id end)
+    ns.db.healCutScan = {
+        build = (GetBuildInfo()), date = date("%Y-%m-%d %H:%M"), scannedTo = st.next - 1,
+        highestSpell = st.highest, results = results,
+    }
+    Print(("scan %s at ID %d: %d spells, %d with a description (%d loaded on request, %d never arrived), "
+        .. "%d read like healing reduction."):format(stopped and "stopped" or "done", st.next - 1, st.found,
+        st.described, st.loaded, st.pendingCount, #results))
+    if st.described == 0 then
+        Print("|cffff4040no spell descriptions could be read.|r Check one by hand: "
+            .. "/dump C_Spell.GetSpellDescription(12294)")
+    end
+    for i = 1, math.min(#results, 40) do
+        local r = results[i]
+        print(("  %d %s: %s%s"):format(r.id, r.name,
+            r.pct and ("-" .. r.pct .. "%") or r.flat and ("-" .. r.flat .. " flat") or "no amount",
+            r.listed and " |cff40ff40(listed)|r" or ""))
+    end
+    if #results > 40 then print(("  ...and %d more in the saved file"):format(#results - 40)) end
+    if st.errors > 0 then print(("  |cffff4040%d spell IDs couldn't be read.|r"):format(st.errors)) end
+    if not stopped and st.highest > st.max - 5000 then
+        Print(("spells exist up to ID %d; there may be more. Try /bhb scan %d."):format(st.highest, st.max * 2))
+    end
+    Print("/reload writes the full list (descriptions and HealCuts.lua lines) to "
+        .. "WTF\\Account\\<account>\\SavedVariables\\BetterHealBars.lua, under healCutScan.")
+end
+
+scanFrame:SetScript("OnUpdate", function()
+    local st = scanState
+    -- Descriptions may be hidden in combat.
+    if InCombatLockdown() then
+        if not st.paused then Print("scan paused while you're in combat.") end
+        st.paused = true
+        return
+    end
+    st.paused = false
+    local stop = debugprofilestop() + SCAN_BUDGET_MS
+    while st.next <= st.max and debugprofilestop() < stop do
+        local ok = pcall(ScanOne, st, st.next)
+        if not ok then st.errors = st.errors + 1 end
+        st.next = st.next + 1
+        if st.next % 10000 == 0 then
+            Print(("scan at ID %d of %d, %d found so far."):format(st.next, st.max, #st.results))
+        end
+    end
+    if st.next > st.max then
+        -- Wait for requested spell text until it stops arriving.
+        st.lastLoad = st.lastLoad or GetTime()
+        if st.pendingCount == 0 or GetTime() - st.lastLoad > SCAN_LOAD_WAIT then FinishScan(false) end
+    end
+end)
+
+local function StartScan(arg)
+    if arg == "stop" then
+        if scanState then FinishScan(true) else Print("no scan running.") end
+        return
+    end
+    if scanState then
+        Print(("scan running: ID %d of %d, %d found. /bhb scan stop ends it."):format(
+            scanState.next, scanState.max, #scanState.results))
+        return
+    end
+    if not (C_Spell and C_Spell.GetSpellName) then
+        Print("|cffff4040this client has no C_Spell.GetSpellName.|r")
+        return
+    end
+    local max = tonumber(arg) or SCAN_DEFAULT_MAX
+    scanState = {
+        next = 1, max = max, found = 0, highest = 0, errors = 0, results = {},
+        described = 0, loaded = 0, pending = {}, pendingCount = 0,
+    }
+    Print(("scanning spell IDs 1 to %d for healing reduction..."):format(max))
+    pcall(scanFrame.RegisterEvent, scanFrame, "SPELL_DATA_LOAD_RESULT")   -- not on every client
+    scanFrame:Show()
+end
+
 SLASH_BETTERHEALBARS1 = "/bhb"
 SLASH_BETTERHEALBARS2 = "/betterhealbars"
 SlashCmdList.BETTERHEALBARS = function(msg)
@@ -1161,6 +1500,11 @@ SlashCmdList.BETTERHEALBARS = function(msg)
     elseif msg == "resetheals" then
         wipe(healSizes)
         Print("measured heal sizes cleared; tooltip averages are used until new heals are measured.")
+    elseif msg:match("^scan") then
+        StartScan(msg:match("^scan%s*(.*)$"))
+    elseif msg:match("^auras") then
+        local ok, err = pcall(DumpAuras, msg:match("^auras%s*(.*)$"))
+        if not ok then Print("|cffff4040aura dump failed:|r " .. tostring(err)) end
     elseif msg == "rescan" then
         Scan()
         MarkAll()

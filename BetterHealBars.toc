@@ -11,5 +11,6 @@
 ## SavedVariables: BetterHealBarsDB
 
 Settings.lua
+HealCuts.lua
 Core.lua
 Options.lua
