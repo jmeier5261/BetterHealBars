@@ -227,34 +227,6 @@ local function Button(parent, text, width)
     b:SetText(text)
     return b
 end
-
--- A button that steps a setting through `values` (shown as `labels`) on each click.
-local function Cycle(parent, x, y, width, key, values, labels, fmt, requires)
-    local b = Button(parent, "", width)
-    b:SetPoint("TOPLEFT", x, y)
-    b:SetScript("OnClick", function()
-        local i = 1
-        for j, v in ipairs(values) do
-            if v == S()[key] then i = j end
-        end
-        S()[key] = values[i % #values + 1]
-        Changed()
-        RefreshWidgets()
-    end)
-    refreshers[#refreshers + 1] = function()
-        local label = labels[1]
-        for j, v in ipairs(values) do
-            if v == S()[key] then label = labels[j] end
-        end
-        b:SetText(fmt:format(label))
-        if requires then b:SetEnabled(S()[requires] and true or false) end
-    end
-    return b
-end
-
-local TEXT_POINTS = { "TOPLEFT", "TOP", "TOPRIGHT", "LEFT", "CENTER", "RIGHT", "BOTTOMLEFT", "BOTTOM", "BOTTOMRIGHT" }
-local TEXT_POINT_LABELS = { "top left", "top", "top right", "left", "center", "right", "bottom left", "bottom", "bottom right" }
-
 -------------------------------------------------------------------------------
 --  Panel
 -------------------------------------------------------------------------------
@@ -379,18 +351,16 @@ local function Build()
     Slider(panel, R + 4, -358, "classColorAlpha", 0, 100, "Class color opacity: %d%%",
         function(s) return s.useClassColors end)
 
-    Header(panel, "Healing Reduction", R, -396)
-    Checkbox(panel, "Shrink heals by the unit's healing reduction", R, -414, "healCutScale",
-        "By default, the game's incoming heal prediction doesn't take into account effects "
-        .. "that reduce healing taken, such as Mortal Strike, so heal bars on an affected unit "
-        .. "show more healing than will actually land.\n\n"
-        .. "Turn this on to compensate: heal bars on a unit with a known healing reduction "
-        .. "are shrunk to the amount that will land.")
-    local cbCutText = Checkbox(panel, "Show it on the health bar", R, -440, "healCutText",
-        "Shows the reduction, such as -50%, over the health bar.")
-    Swatch(panel, cbCutText.label, "healCutColor")
-    Cycle(panel, R + 4, -468, 200, "healCutTextPoint", TEXT_POINTS, TEXT_POINT_LABELS, "Text position: %s",
-        "healCutText")
+    Header(panel, "Heals Over Time", R, -396)
+    local cbHots = Checkbox(panel, "Show my heals over time", R, -414, "showMyHots",
+        "The game's incoming heal prediction doesn't include heals over time. With this on, "
+        .. "the full amount your Renew, Rejuvenation and Regrowth have still to heal is drawn "
+        .. "after the other heal bars, shrinking as each tick lands.\n\n"
+        .. "The amount comes from the spell's tooltip, so it follows your healing power. Only "
+        .. "your own HoTs can be shown: in combat the game hides everyone's buffs from addons, "
+        .. "so yours are tracked from your casts, and the game itself hides the bar as soon as "
+        .. "the HoT is gone, dispelled included.")
+    Swatch(panel, cbHots.label, "myHotColor")
 
     -- Copy / reset / test
     Header(panel, "Copy this tab's settings to", L, -360)
@@ -419,15 +389,15 @@ local function Build()
     local test = Button(panel, "Toggle test bars", 130)
     test:SetPoint("LEFT", reset, "RIGHT", 8, 0)
     test:SetScript("OnClick", function() SlashCmdList.BETTERHEALBARS("test") end)
-    Note(panel, "Test bars: fake heals on every frame. Alternate frames show the overheal color, every "
-        .. "third a -50% healing reduction, and class colors a sample healer. Full-health units only "
-        .. "show them in the overflow area.", L, -446, 290)
+    Note(panel, "Test bars: fake heals and a HoT on every frame. Alternate frames show the overheal "
+        .. "color, and class colors a sample healer. Full-health units only show them in the "
+        .. "overflow area.", L, -446, 290)
 
     Header(panel, "Master Opacity", L, -496)
     Slider(panel, L + 4, -532, "masterOpacity", 0, 100, "Master opacity: %d%%",
         function(s) return not s.useClassColors end)
-    Note(panel, "Scales the opacity of every color you picked above (your heals, other players' heals "
-        .. "and the overheal color), on top of each color's own opacity. Off while class colors are "
+    Note(panel, "Scales the opacity of every color you picked above (your heals, other players' heals, "
+        .. "your HoTs and the overheal color), on top of each color's own opacity. Off while class colors are "
         .. "on, since those use the class color opacity instead.", R, -516, 270)
 
     panel:SetScript("OnShow", RefreshAll)

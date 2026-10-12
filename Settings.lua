@@ -35,10 +35,8 @@ local function ScopeDefaults(my, other, overflowOn, overflowPct)
 
         masterOpacity      = 100,           -- % multiplier on the colors above; ignored with class colors
 
-        healCutScale       = true,          -- shrink heal bars by the unit's healing reduction
-        healCutText        = true,          -- "-50%" on the health bar
-        healCutColor       = Color(1, 0.25, 0.25, 1),
-        healCutTextPoint   = "TOPRIGHT",
+        showMyHots         = true,          -- what your HoTs have still to heal, after the other bars
+        myHotColor         = Color(0.30, 0.80, 0.55, 0.6),
     }
 end
 

@@ -17,7 +17,10 @@
 --    * your heal's size is the spell tooltip's average times a ratio measured
 --      from your real non-crit heals, per spell ID (so per rank) and tooltip,
 --    * class colors split "others" into one bar per group healer, each read
---      with that healer as the calculator's source.
+--      with that healer as the calculator's source,
+--    * your HoTs (not in the heal API, and auras are hidden in combat) are
+--      tracked from your casts: plain amounts from the tooltip, drawn last,
+--      seen through engine aura slots that the game hides once a HoT is gone.
 --
 --  Copyright (C) 2026 jmeier5261
 --  Licensed under the GNU General Public License v3.0. See LICENSE.
@@ -67,11 +70,30 @@ local playerClass
 local myCast         -- { spell, size, source } while you cast, else nil
 local healSizes = {} -- spellID -> tooltip range -> measured ratio; the saved table once logged in
 
+-- Your HoTs by their Rank 1 spell ID. Every rank shares the name, and casts
+-- are matched by name (in the client's language). tick: seconds between
+-- ticks. direct: the spell also heals up front; that part is in the heal API
+-- already, and it's what your heal size is measured from.
+local HOT_SPELLS = {
+    [139]  = { tick = 3 },                  -- Renew
+    [774]  = { tick = 3 },                  -- Rejuvenation
+    [8936] = { tick = 3, direct = true },   -- Regrowth
+}
+-- The same entries in a fixed order: each HoT has its own bar on every frame
+-- and its own aura slot. name and ids (every rank's spell ID) fill in at login.
+local HOT_FAMILIES = {}
+for id, info in pairs(HOT_SPELLS) do
+    info.rank1, info.ids = id, { [id] = true }
+    HOT_FAMILIES[#HOT_FAMILIES + 1] = info
+end
+table.sort(HOT_FAMILIES, function(a, b) return a.rank1 < b.rank1 end)
+
 ns.settingsGen = 0
 ns.testMode = false
 ns.castDebug = false
 ns.stats = {
     secretAmounts = false, lastError = nil, apiOK = false, lastCast = nil,
+    hotSlotsBuilt = 0, hotSlotsError = nil, hotRanks = 0,
     castTimes = { player = { plain = 0, secret = 0, missing = 0 }, others = { plain = 0, secret = 0, missing = 0 } },
 }
 
@@ -142,9 +164,7 @@ local function PlaceBar(bar, target, pts, near, vert, rev, w, h, tex)
 end
 
 -- Anchors only; skipped when nothing that affects geometry has changed.
--- mod: healing taken multiplier. A StatusBar's fill is value / max of its
--- length, so bars mod times as long show every (secret) amount times mod.
-local function Layout(rec, S, nS, mod)
+local function Layout(rec, S, nS)
     local health = rec.health
     local fill = health:GetStatusBarTexture()
     if not fill then return false end
@@ -169,16 +189,10 @@ local function Layout(rec, S, nS, mod)
 
     local L = rec.L
     if L.fill == fill and L.dir == dir and L.inv == inv and L.w == w and L.h == h
-       and L.ext == ext and L.nS == nS and L.tex == tex and L.mod == mod and L.gen == ns.settingsGen then
+       and L.ext == ext and L.nS == nS and L.tex == tex and L.gen == ns.settingsGen then
         return true
     end
-    L.fill, L.dir, L.inv, L.w, L.h, L.ext, L.nS, L.tex, L.mod, L.gen =
-        fill, dir, inv, w, h, ext, nS, tex, mod, ns.settingsGen
-    -- The bars' own length; the holder below still clips at the real bar end.
-    local bw, bh = w, h
-    if mod < 1 then
-        if vert then bh = h * math.max(mod, 0.01) else bw = w * math.max(mod, 0.01) end
-    end
+    L.fill, L.dir, L.inv, L.w, L.h, L.ext, L.nS, L.tex, L.gen = fill, dir, inv, w, h, ext, nS, tex, ns.settingsGen
 
     -- Holder = health bar rect plus the overflow allowance; it clips everything.
     local holder = rec.holder
@@ -196,7 +210,7 @@ local function Layout(rec, S, nS, mod)
     -- Chain: [your heals] -> [one bar per group healer (class colors)]
     local prev, prevPts = fill, seamPts
     if S.showMine then
-        PlaceBar(rec.mine, prev, prevPts, near, vert, rev, bw, bh, tex)
+        PlaceBar(rec.mine, prev, prevPts, near, vert, rev, w, h, tex)
         rec.mine:Show()
         local mineFill = rec.mine:GetStatusBarTexture()
         prev, prevPts = mineFill, far
@@ -230,7 +244,7 @@ local function Layout(rec, S, nS, mod)
             seg = NewBar(holder)
             rec.segs[i] = seg
         end
-        PlaceBar(seg, prev, prevPts, near, vert, rev, bw, bh, tex)
+        PlaceBar(seg, prev, prevPts, near, vert, rev, w, h, tex)
         seg:Show()
         prev, prevPts = seg:GetStatusBarTexture(), far
     end
@@ -244,76 +258,230 @@ local function Layout(rec, S, nS, mod)
         ac:ClearAllPoints()
         ac:SetPoint(near[1], prev, prevPts[1], 0, 0)
         ac:SetPoint(FAR_CORNER[dir], holder, FAR_CORNER[dir], 0, 0)
-        PlaceBar(rec.rest, fill, seamPts, near, vert, rev, bw, bh, tex)
+        PlaceBar(rec.rest, fill, seamPts, near, vert, rev, w, h, tex)
         ac:Show()
         rec.rest:Show()
     else
         ac:Hide()
     end
+
+    -- Your HoTs last, one bar per HoT: the clip above relies on the chain
+    -- adding up to part of the total, so they start where everything else
+    -- ends. Once the frame's aura slots are built these bars are only
+    -- geometry (plain white, invisible): what shows is each slot's texture
+    -- laid over its bar (see "Your HoTs on screen").
+    local hp, hpPts = prev, prevPts
+    if S.showOthers then hp, hpPts = rec.rest:GetStatusBarTexture(), far end
+    for _, bar in ipairs(rec.hotBars) do
+        if S.showMyHots then
+            PlaceBar(bar, hp, hpPts, near, vert, rev, w, h, rec.hotSlots and WHITE or tex)
+            bar:Show()
+            hp, hpPts = bar:GetStatusBarTexture(), far
+        else
+            bar:Hide()
+        end
+    end
     return true
 end
 
 -------------------------------------------------------------------------------
---  Healing reduction: known debuffs (HealCuts.lua) on friendly units. The
---  heal prediction API leaves them out. A hidden spell ID just doesn't count.
+--  Your heals over time. The heal API leaves HoTs out, and in combat the
+--  client hides every aura from addons, so your HoTs are tracked from your
+--  casts (see "Your heals over time" further down). This part matches them
+--  to a frame's unit and adds up what's still to land: plain numbers.
 -------------------------------------------------------------------------------
-local cutCache = {}   -- unit token -> healing taken multiplier (1 = none)
-local cutBest = {}    -- scratch: group -> strongest pct
+local hotByName = {}   -- spell name -> HOT_SPELLS entry; filled at login
+-- "spell name:target name" -> { spell, info, total, ticks, tick, start, created, left, name, guid, token }
+local myHots = {}
 
-local function ScanHealCuts(unit)
-    local hostile = UnitCanAttack("player", unit)
-    if not issecretvalue(hostile) and hostile then return 1 end
-    wipe(cutBest)
-    for i = 1, 40 do
-        local a = C_UnitAuras.GetAuraDataByIndex(unit, i, "HARMFUL")
-        if not a then break end
-        local id = a.spellId
-        local cut = not issecretvalue(id) and ns.HEAL_CUTS[id]
-        if cut and (cutBest[cut.group] or 0) < cut.pct then cutBest[cut.group] = cut.pct end
+-- One aura; nil past the last one; false when the client hides it from
+-- addons (in combat, reading such an aura raises an error).
+local function ReadAura(unit, i, filter)
+    local check = C_Secrets and C_Secrets.ShouldUnitAuraIndexBeSecret
+    if check then
+        local ok, secret = pcall(check, unit, i, filter)
+        if ok and (issecretvalue(secret) or secret) then return false end
     end
-    local mod = 1
-    for _, pct in pairs(cutBest) do mod = mod * (1 - pct / 100) end
-    return mod
+    local ok, a = pcall(C_UnitAuras.GetAuraDataByIndex, unit, i, filter)
+    if not ok then return false end
+    return a
 end
 
-local function UnitHealMod(unit)
-    local m = cutCache[unit]
-    if m == nil then
-        local ok, v = pcall(ScanHealCuts, unit)
-        m = ok and v or 1
-        cutCache[unit] = m
-    end
-    return m
+-- "Name", "Name-Realm" or "Name Surname" -> "Name".
+local function ShortName(name)
+    return type(name) == "string" and name:match("^[^%s%-]+") or nil
 end
 
-local function CutPercent(mod) return math.floor((1 - mod) * 100 + 0.5) end
+-- Ticks still to land; 0 once the HoT has run out.
+local function HotTicksLeft(h, now)
+    return math.max(0, math.min(h.ticks, h.ticks - math.floor((now - h.start) / h.tick)))
+end
 
--- The "-50%" text over the health bar.
-local function PaintCut(rec, S, mod)
-    local f = rec.cutFrame
-    if not S.healCutText or mod >= 1 then
-        f:Hide()
-        return
+-- Whether a tracked HoT is on this unit: by GUID, else by token, else by name.
+local function HotOnUnit(unit, h)
+    local guid = UnitGUID(unit)
+    if h.guid and guid and not issecretvalue(guid) then return guid == h.guid end
+    if unit == h.token then return true end
+    if h.token then
+        local same = UnitIsUnit(unit, h.token)
+        if not issecretvalue(same) then return same and true or false end
     end
-    local health = rec.health
-    local point = S.healCutTextPoint or "TOPRIGHT"
-    local size = math.max(8, math.min(14, math.floor(health:GetHeight() * 0.5)))
-    local fs = rec.cutText
-    if f._health ~= health or f._point ~= point or f._size ~= size then
-        f._health, f._point, f._size = health, point, size
-        f:ClearAllPoints()
-        f:SetAllPoints(health)
-        f:SetFrameLevel(health:GetFrameLevel() + 5)
-        fs:SetFont(STANDARD_TEXT_FONT, size, "OUTLINE")
-        fs:ClearAllPoints()
-        local x = point:find("LEFT") and 2 or point:find("RIGHT") and -2 or 0
-        local y = point:find("TOP") and -1 or point:find("BOTTOM") and 1 or 0
-        fs:SetPoint(point, f, point, x, y)
+    local name = UnitName(unit)
+    if name and not issecretvalue(name) then return ShortName(name) == h.name end
+    return false
+end
+
+-- What your HoTs on this unit have still to heal: one HoT (a HOT_SPELLS
+-- entry), or all of them.
+local function MyHotAmount(unit, info)
+    local now, sum = GetTime(), 0
+    for _, h in pairs(myHots) do
+        if (not info or h.info == info) and HotOnUnit(unit, h) then
+            sum = sum + HotTicksLeft(h, now) * h.total / h.ticks
+        end
     end
-    local c = S.healCutColor
-    fs:SetTextColor(c.r, c.g, c.b, c.a or 1)
-    fs:SetText(("-%d%%"):format(CutPercent(mod)))
-    f:Show()
+    return sum
+end
+
+-------------------------------------------------------------------------------
+--  Your HoTs on screen. In combat every aura is hidden from Lua, so a HoT
+--  dispelled then can't be noticed there. The engine's AuraContainer matches
+--  a unit's auras itself, though: per HoT, one slot filtered to your casts of
+--  it (HELPFUL|PLAYER, every rank's spell ID), which the game shows only
+--  while that HoT is on the unit. (Buff spell-ID filters work on units you
+--  can assist; the engine's identity gate drops debuff ones on friendly
+--  units, so this can't be done for debuffs.) What a slot holds shows and
+--  hides with it, and while auras are secret every write to a slot's objects
+--  is refused, so its texture is made once, in the slot's initializer, and
+--  laid over the HoT's own bar: that bar stays ours to update and draws
+--  nothing itself. The container can be pointed at another unit any time
+--  ("none" turns it off).
+-------------------------------------------------------------------------------
+local hotQueue = {}          -- records waiting for their container
+local hotRestyle = false     -- a restyle was refused (auras secret); retried out of combat
+local hotRanksReady = false  -- every rank's spell ID collected (see ScanHotRanks)
+
+-- The slot texture's look (refused while auras are secret).
+local function StyleHotSlot(rec, tex)
+    local S = ns.GetSettings(rec.scope)
+    local fill = rec.health:GetStatusBarTexture()
+    tex:SetTexture((S.useHealthTexture and fill and fill:GetTexture()) or WHITE)
+    ColorTex(tex, S.myHotColor, S.useClassColors and 1 or (S.masterOpacity or 100) / 100)
+end
+
+local function InitHotSlot(rec, i, slot)
+    -- The engine may run this again for the same button; build only once.
+    if rec.hotTex[i] then return end
+    local lvl = rec.health:GetFrameLevel()
+    slot:SetFrameLevel(lvl + 2)
+    slot:EnableMouse(false)
+    slot:SetSize(1, 1)
+    slot:SetPoint("CENTER", rec.holder, "CENTER")
+    -- Clipped like the other bars: the holder is the bar plus the overflow allowance.
+    local clip = CreateFrame("Frame", nil, slot)
+    clip:SetClipsChildren(true)
+    clip:SetAllPoints(rec.holder)
+    clip:SetFrameLevel(lvl + 2)
+    local tex = clip:CreateTexture(nil, "ARTWORK")
+    tex:SetAllPoints(rec.hotBars[i]:GetStatusBarTexture())
+    rec.hotTex[i] = tex
+    StyleHotSlot(rec, tex)
+end
+
+-- The unit the container watches: the frame's, or "none" while it's off.
+local function BindHotUnit(rec, unit)
+    local c = rec.hotContainer
+    unit = unit or "none"
+    if c:GetUnit() ~= unit then
+        c:SetUnit(unit)
+        c:UpdateAllAuras()
+    end
+end
+
+local function BuildHotContainer(rec)
+    if not C_AddOns.IsAddOnLoaded("Blizzard_AuraContainer") then C_AddOns.LoadAddOn("Blizzard_AuraContainer") end
+    -- From here on the bars are plain white geometry: the slot textures anchor
+    -- to their fills, so the fill texture must not be swapped again.
+    for _, bar in ipairs(rec.hotBars) do
+        bar:SetStatusBarTexture(WHITE)
+        bar._tex = WHITE
+    end
+    local c = CreateFrame("AuraContainer", nil, rec.owner, "CustomAuraContainerTemplate")
+    c:SetPoint("CENTER", rec.holder, "CENTER")
+    c:SetSize(1, 1)
+    c:SetFrameLevel(rec.health:GetFrameLevel() + 2)
+    for i, info in ipairs(HOT_FAMILIES) do
+        c:AddAuraSlot("bhbhot" .. info.rank1, "HELPFUL|PLAYER", {
+            candidateFilters = { includeSpellIDs = info.ids },
+            initializeFrame = function(slot) InitHotSlot(rec, i, slot) end,
+        })
+    end
+    rec.hotContainer = c
+    rec.hotSlots = true
+    rec.L.gen = nil      -- lay the bars out again, as plain white
+    dirty[rec] = true    -- the next paint binds the unit (after the slots, as the engine needs)
+end
+
+-- A few containers per frame: each slot is built through the engine.
+local function BuildQueuedHots()
+    for _ = 1, 2 do
+        local rec = table.remove(hotQueue, 1)
+        if not rec then return end
+        local ok, err = pcall(BuildHotContainer, rec)
+        if ok then
+            ns.stats.hotSlotsBuilt = ns.stats.hotSlotsBuilt + 1
+        else
+            rec.hotFailed = true
+            if not ns.stats.hotSlotsError and ns.Print then
+                ns.Print("|cffff4040the game's aura slots didn't work, so a HoT dispelled in combat keeps "
+                    .. "showing until it would have run out:|r " .. tostring(err))
+            end
+            ns.stats.hotSlotsError = err
+        end
+    end
+end
+
+-- Settings changed: restyle every slot texture built so far.
+local function RestyleHots()
+    hotRestyle = false
+    for _, rec in ipairs(recList) do
+        for _, tex in pairs(rec.hotTex or EMPTY) do
+            if not pcall(StyleHotSlot, rec, tex) then hotRestyle = true end
+        end
+    end
+end
+
+-- Every rank of a HoT has its own spell ID, and a slot's filter needs them
+-- all: at login, spell IDs are walked a few thousand per frame and each one
+-- named like one of your HoTs is added. Containers wait until it's done.
+local HOT_RANK_MAX = 100000
+local hotRankNext = 1
+local hotRankFrame = CreateFrame("Frame")
+hotRankFrame:Hide()
+hotRankFrame:SetScript("OnUpdate", function(self)
+    local stop = debugprofilestop() + 4
+    while hotRankNext <= HOT_RANK_MAX and debugprofilestop() < stop do
+        local name = C_Spell.GetSpellName(hotRankNext)
+        local info = name and not issecretvalue(name) and hotByName[name]
+        if info then info.ids[hotRankNext] = true end
+        hotRankNext = hotRankNext + 1
+    end
+    if hotRankNext > HOT_RANK_MAX then
+        self:Hide()
+        local n = 0
+        for _, info in ipairs(HOT_FAMILIES) do
+            for _ in pairs(info.ids) do n = n + 1 end
+        end
+        ns.stats.hotRanks = n
+        hotRanksReady = true
+        ns.MarkAll()
+    end
+end)
+
+local function ScanHotRanks()
+    if C_Spell and C_Spell.GetSpellName and debugprofilestop then
+        hotRankFrame:Show()
+    end
 end
 
 -- Most of your heal that can land and still count as wasting >= pct% (and >= 1).
@@ -328,20 +496,20 @@ end
 local function Paint(rec)
     local S = ns.GetSettings(rec.scope)
     local unit = rec.unit
-    if (rec.toggle and not S[rec.toggle]) or not unit or not rec.owner:IsVisible() or not UnitExists(unit) then
+    local draw = (S.showMine or S.showOthers or S.showMyHots) and not (rec.toggle and not S[rec.toggle])
+        and unit and rec.owner:IsVisible() and UnitExists(unit)
+    -- Your HoTs' aura slots: the container is built once (queued, once every
+    -- rank is known), then kept on this frame's unit while HoTs show.
+    local hotsOn = draw and S.showMyHots
+    if hotsOn and hotRanksReady and not (rec.hotContainer or rec.hotQueued or rec.hotFailed) then
+        rec.hotQueued = true
+        hotQueue[#hotQueue + 1] = rec
+    end
+    if rec.hotContainer then pcall(BindHotUnit, rec, hotsOn and unit or nil) end
+    if not draw then
         rec.holder:Hide()
-        rec.cutFrame:Hide()
         return
     end
-    rec.mod = UnitHealMod(unit)
-    local mod = rec.mod
-    if ns.testMode then mod = (rec.testIndex % 3 == 0) and 0.5 or 1 end
-    PaintCut(rec, S, mod)
-    if not (S.showMine or S.showOthers) then
-        rec.holder:Hide()
-        return
-    end
-    local barMod = S.healCutScale and mod or 1
 
     local total, mine, others, maxHP, over
     local mineFit, useFlag   -- mineFit may be SECRET; useFlag is the plain "have it" flag
@@ -359,12 +527,7 @@ local function Paint(rec)
         end
         over = (rec.testIndex % 2 == 0)
     else
-        local p = S.overflowEnabled and (S.overflowPct or 0) / 100 or 0
-        local overflow = 1 + p
-        -- Shrunk bars: the calculator caps amounts before they're shrunk, so
-        -- loosen its cap until mod x cap >= missing + overflow for any missing
-        -- health; the holder still clips at the real limit.
-        if barMod < 1 then overflow = 1 + ((1 - barMod) + p) / math.max(barMod, 0.01) end
+        local overflow = S.overflowEnabled and (1 + (S.overflowPct or 0) / 100) or 1
         calc:SetIncomingHealOverflowPercent(overflow)
         UnitGetDetailedHealPrediction(unit, "player", calc)
         total, mine, others = calc:GetIncomingHeals()
@@ -396,7 +559,7 @@ local function Paint(rec)
         rec.holder:Hide()
         return
     end
-    if not Layout(rec, S, nS, barMod) then
+    if not Layout(rec, S, nS) then
         rec.holder:Hide()
         return
     end
@@ -415,8 +578,7 @@ local function Paint(rec)
             -- Wasted >= threshold (and >= 1) <=> lands <= cut. Over the range
             -- [cut, cut + 1] the bar clamps whole amounts to empty (flagged)
             -- or full (not), so flagRest shows over all of your fill or none.
-            -- The heal is what lands after the unit's healing reduction.
-            local cut = OverhealCut(myCast.size * mod, S.overhealThreshold)
+            local cut = OverhealCut(myCast.size, S.overhealThreshold)
             local fb = rec.flagBar
             fb:SetMinMaxValues(cut, cut + 1)
             fb:SetValue(mineFit)
@@ -451,6 +613,23 @@ local function Paint(rec)
         -- Explicit branch: `a and total or others` would truth-test a secret.
         if S.showMine then rec.rest:SetValue(total) else rec.rest:SetValue(others) end
         SetColor(rec.rest, S.otherColor, master)
+    end
+    if S.showMyHots then
+        for i, bar in ipairs(rec.hotBars) do
+            SetRange(bar, maxHP)
+            if ns.testMode then
+                bar:SetValue(i == 1 and 12 or 0)
+            else
+                bar:SetValue(MyHotAmount(unit, HOT_FAMILIES[i]))
+            end
+            -- With the aura slots built, the slot's texture is what shows; test
+            -- bars have no aura behind them, so they draw themselves.
+            if rec.hotSlots and not ns.testMode then
+                bar:GetStatusBarTexture():SetAlpha(0)
+            else
+                SetColor(bar, S.myHotColor, master)
+            end
+        end
     end
     rec.holder:Show()
 end
@@ -524,12 +703,16 @@ driver:SetScript("OnUpdate", function(self)
         allDirty = false
         wipe(dirty)
         for _, rec in ipairs(recList) do SafePaint(rec) end
-        return
+    else
+        for rec in pairs(dirty) do
+            dirty[rec] = nil
+            SafePaint(rec)
+        end
     end
-    for rec in pairs(dirty) do
-        dirty[rec] = nil
-        SafePaint(rec)
-    end
+    -- HoT aura containers queued by those paints; each built one is marked
+    -- dirty, so the next frame binds its unit.
+    if #hotQueue > 0 then BuildQueuedHots() end
+    if #hotQueue > 0 or next(dirty) then self:Show() end
 end)
 
 local function MarkDirty(rec)
@@ -545,18 +728,12 @@ local function MarkUnit(unit)
     driver:Show()
 end
 
--- Debuffs changed: re-read the healing reduction of every frame showing this
--- unit (target / focus included), repainting only those whose value changed.
-local function OnAura(unit)
-    cutCache[unit] = nil
-    if mapDirty then RebuildMap() end
-    local l = unitMap[unit]
-    if not l then return end
-    for i = 1, #l do
-        local rec = l[i]
-        cutCache[rec.unit] = nil
-        if UnitHealMod(rec.unit) ~= rec.mod then MarkDirty(rec) end
+-- Repaints every frame showing the unit one of your HoTs is on.
+local function MarkHot(h)
+    for _, rec in ipairs(recList) do
+        if rec.unit and HotOnUnit(rec.unit, h) then dirty[rec] = true end
     end
+    driver:Show()
 end
 
 local function MarkAll()
@@ -569,6 +746,7 @@ ns.MarkAll = MarkAll
 -- Settings changed: force re-layout and repaint everything.
 function ns.Refresh()
     ns.settingsGen = ns.settingsGen + 1
+    RestyleHots()
     MarkAll()
 end
 
@@ -604,10 +782,10 @@ local function BuildRecord(owner, health, kind, scope)
     rec.flagBar = NewBar(holder)
     rec.flagBar:Hide()
     rec.flagRest = rec.flagBar:CreateTexture(nil, "ARTWORK")
-    -- Healing reduction text: its own frame, since the holder clips and hides.
-    rec.cutFrame = CreateFrame("Frame", nil, owner)
-    rec.cutFrame:Hide()
-    rec.cutText = rec.cutFrame:CreateFontString(nil, "OVERLAY")
+    -- One bar per HoT; once the aura slots are built, the slots' textures
+    -- (rec.hotTex) draw over them instead.
+    rec.hotBars, rec.hotTex = {}, {}
+    for i = 1, #HOT_FAMILIES do rec.hotBars[i] = NewBar(holder) end
 
     records[owner] = rec
     recList[#recList + 1] = rec
@@ -788,6 +966,31 @@ local function TooltipHealSize(spellID)
     if first and first > 0 then return first, first, first end
 end
 
+-- Lowercase sentences of a description.
+local function Sentences(text)
+    local list = {}
+    text = text:lower():gsub("[\r\n]+", ". ")
+    for s in (text .. ". "):gmatch("(.-)%.%s+") do list[#list + 1] = s end
+    return list
+end
+
+-- A heal over time in a description: "heals the target of 45 damage over 15
+-- sec", "for 32 over 12 sec", "restores 61 health over 18 sec" (mana, rage
+-- and energy over time don't count). English text only. Returns the total,
+-- the duration in seconds and the sentence, or nil.
+local NOT_HEALTH = { mana = true, rage = true, energy = true }
+local function HotFromText(text)
+    local n
+    repeat text, n = text:gsub(THOUSANDS, "%1%2") until n == 0
+    for _, s in ipairs(Sentences(text)) do
+        if s:find("heal") or s:find("restores") then
+            for amount, word, secs in s:gmatch("(%d+)%s*(%a*)%s+over (%d+) sec") do
+                if not NOT_HEALTH[word] then return tonumber(amount), tonumber(secs), s end
+            end
+        end
+    end
+end
+
 local function SpellName(spellID)
     if C_Spell and C_Spell.GetSpellName then return C_Spell.GetSpellName(spellID) end
     return GetSpellInfo and (GetSpellInfo(spellID)) or tostring(spellID)
@@ -918,7 +1121,6 @@ end
 local function TrySample(cast, heal)
     if math.abs(heal.t - cast.t) > MATCH_WINDOW then return false, "no cast of yours just finished" end
     if heal.flag == "CRITICAL" then return false, "crit" end
-    if heal.mod < 1 then return false, ("-%d%% healing reduction on %s"):format(CutPercent(heal.mod), heal.unit) end
     if cast.target then
         if not SameName(cast.target, heal.name) then return false, "your cast was sent to " .. cast.target end
     elseif heal.unit ~= "player" then
@@ -955,7 +1157,7 @@ local function OnHealLanded(unit, action, flag, amount)
     end
     local name = UnitName(unit)
     local heal = { unit = unit, name = not issecretvalue(name) and name or nil, amount = amount, flag = flag,
-                   mod = UnitHealMod(unit), t = GetTime() }
+                   t = GetTime() }
     if pendingCast and heal.t - pendingCast.t > MATCH_WINDOW then pendingCast = nil end
     if pendingCast then
         local cast = pendingCast
@@ -1003,6 +1205,166 @@ local function OnCastSent(target, castGUID)
     end
 end
 
+-------------------------------------------------------------------------------
+--  Your heals over time, tracked from your casts: in combat every aura is
+--  hidden from addons, but your own casts' spell and target aren't. The amount
+--  is the tooltip's, which follows your healing power. Out of combat your
+--  auras are readable again, so they correct what was tracked.
+-------------------------------------------------------------------------------
+local HOT_SYNC_GRACE = 1   -- seconds a new HoT is kept before its aura must show up
+local hotTicker
+
+-- The group token (player, partyN, raidN) for a unit, or nil.
+local function GroupToken(unit)
+    if IsGroupToken(unit) then return unit end
+    local same = UnitIsUnit(unit, "player")
+    if not issecretvalue(same) and same then return "player" end
+    local inRaid = IsInRaid()
+    for i = 1, inRaid and 40 or 4 do
+        local g = (inRaid and "raid" or "party") .. i
+        same = UnitIsUnit(unit, g)
+        if not issecretvalue(same) and same then return g end
+    end
+end
+
+-- The unit with this name: you, a group member, then target and focus.
+local function FindUnitByName(name)
+    local short = ShortName(name)
+    if not short then return nil end
+    local function Is(u)
+        if not UnitExists(u) then return false end
+        local n = UnitName(u)
+        return n ~= nil and not issecretvalue(n) and ShortName(n) == short
+    end
+    if Is("player") then return "player" end
+    local inRaid = IsInRaid()
+    for i = 1, inRaid and 40 or 4 do
+        local u = (inRaid and "raid" or "party") .. i
+        if Is(u) then return u end
+    end
+    for _, u in ipairs(ALIAS_TOKENS) do
+        if Is(u) then return u end
+    end
+end
+
+local function HotTick()
+    local now = GetTime()
+    for key, h in pairs(myHots) do
+        local left = HotTicksLeft(h, now)
+        local dead = h.token and UnitIsDeadOrGhost(h.token)
+        if issecretvalue(dead) then dead = false end
+        if left <= 0 or dead then
+            myHots[key] = nil
+            MarkHot(h)
+        elseif left ~= h.left then
+            h.left = left
+            MarkHot(h)
+        end
+    end
+    if not next(myHots) and hotTicker then
+        hotTicker:Cancel()
+        hotTicker = nil
+    end
+end
+
+local function NewHot(spellID, info, name, guid, token)
+    local text = SpellDescription(spellID)
+    local total, duration = nil, nil
+    if text then total, duration = HotFromText(text) end
+    if not (total and duration and duration > 0) then return nil end
+    local ticks = math.max(1, Round(duration / info.tick))
+    local now = GetTime()
+    return {
+        spell = spellID, info = info, total = total, ticks = ticks, tick = duration / ticks, start = now, created = now,
+        left = ticks, name = name, guid = guid, token = token,
+    }
+end
+
+local function AddHot(key, h)
+    local old = myHots[key]
+    myHots[key] = h
+    if old then MarkHot(old) end
+    MarkHot(h)
+    if not hotTicker then hotTicker = C_Timer.NewTicker(0.2, HotTick) end
+end
+
+-- Your cast succeeded: when it's a HoT, track it on the unit it was sent to.
+-- Called on UNIT_SPELLCAST_SUCCEEDED only, so a cast that's interrupted,
+-- fails or is cancelled (a Regrowth pushed out of range mid-cast) is never
+-- tracked. Returns the spell's HOT_SPELLS entry, or nil when it isn't a HoT.
+local function TrackHot(spellID, sentName)
+    local spellName = SpellName(spellID)
+    local info = spellName and not issecretvalue(spellName) and hotByName[spellName]
+    if not info then return nil end
+    -- No name sent: a self-cast.
+    local unit = sentName and FindUnitByName(sentName) or (not sentName and "player") or nil
+    local name = ShortName(sentName) or (unit and ShortName(Plain(UnitName(unit))))
+    local guid = unit and Plain(UnitGUID(unit))
+    local token = unit and GroupToken(unit)
+    local h = (name or guid or token) and NewHot(spellID, info, name, guid, token)
+    if ns.castDebug then
+        print(("|cff33ccffBHB|r   your %s on %s: %s"):format(SpellLabel(spellID), name or "?",
+            h and ("%d over %ds in %d ticks"):format(h.total, Round(h.ticks * h.tick), h.ticks)
+              or "|cffff4040not tracked (no amount in the tooltip, or the target wasn't found)|r"))
+    end
+    if h then AddHot(spellName .. ":" .. (name or guid or token), h) end
+    return info
+end
+
+-- Out of combat your auras are readable: drop HoTs that are gone (dispelled
+-- or cancelled), line their timers up with the real ones, and pick up HoTs
+-- cast before a /reload.
+local function SyncHots(unit)
+    if InCombatLockdown() or not UnitExists(unit) then return end
+    local check = C_Secrets and C_Secrets.ShouldAurasBeSecret
+    if check then
+        local ok, secret = pcall(check)
+        if not ok or issecretvalue(secret) or secret then return end
+    end
+    local name = ShortName(Plain(UnitName(unit)))
+    if not name then return end
+    local guid, token = Plain(UnitGUID(unit)), GroupToken(unit)
+    local seen = {}
+    for i = 1, 40 do
+        local a = ReadAura(unit, i, "HELPFUL|PLAYER")
+        if a == nil then break end
+        local info = a and not issecretvalue(a.name) and hotByName[a.name]
+        if info then
+            local key = a.name .. ":" .. name
+            seen[key] = true
+            local h = myHots[key]
+            if not h then
+                h = NewHot(a.spellId, info, name, guid, token)
+                if h then AddHot(key, h) end
+            end
+            local exp, dur = a.expirationTime, a.duration
+            if h and type(exp) == "number" and exp > 0 and type(dur) == "number" and dur > 0 then
+                h.start, h.tick = exp - dur, dur / h.ticks
+                MarkHot(h)
+            end
+        end
+    end
+    local now = GetTime()
+    for key, h in pairs(myHots) do
+        if not seen[key] and now - h.created > HOT_SYNC_GRACE and HotOnUnit(unit, h) then
+            myHots[key] = nil
+            MarkHot(h)
+        end
+    end
+end
+ns.SyncHots = SyncHots
+
+-- Leaving combat, a roster change or a /reload: re-find every HoT's unit and sync.
+local function SyncAllHots()
+    for _, h in pairs(myHots) do
+        local u = h.name and FindUnitByName(h.name)
+        if u then h.token = GroupToken(u) end
+    end
+    SyncHots("player")
+    local inRaid = IsInRaid()
+    for i = 1, inRaid and 40 or 4 do SyncHots((inRaid and "raid" or "party") .. i) end
+end
+
 local function OnCastSucceeded(castGUID, spellID)
     local mine = myCast and IsMyCast(castGUID) and (myCast.guid or myCast.spell == Plain(spellID))
     spellID = Plain(spellID) or (mine and myCast.spell)
@@ -1015,6 +1377,9 @@ local function OnCastSucceeded(castGUID, spellID)
     else
         tip, target = Tooltip(spellID), SentTarget(castGUID)
     end
+    -- A HoT with nothing up front has no heal landing now to measure.
+    local hot = TrackHot(spellID, target)
+    if hot and not hot.direct then return end
     local cast = { spell = spellID, tip = tip, target = target, t = GetTime() }
     local heal = pendingHeal
     pendingHeal = nil
@@ -1133,7 +1498,11 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
     if UNIT_EVENTS[event] then
         MarkUnit(arg1)
     elseif event == "UNIT_AURA" then
-        OnAura(arg1)
+        if arg1 and (IsGroupToken(arg1) or arg1 == "target" or arg1 == "focus") then SyncHots(arg1) end
+        if ns.auraLog and arg1 == ns.auraLog then
+            local ok, err = pcall(ns.LogAuraEvent, arg1, arg2)
+            if not ok then print("|cff33ccffBHB|r aura log failed: " .. tostring(err)) end
+        end
     elseif event == "UNIT_COMBAT" then
         OnHealLanded(arg1, arg2, arg3, arg4)
     elseif event == "UNIT_SPELLCAST_SENT" then
@@ -1154,14 +1523,18 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
     elseif event == "PLAYER_TARGET_CHANGED" or event == "PLAYER_FOCUS_CHANGED" then
         -- Same token, new unit (which may now also be you).
         local token = event == "PLAYER_TARGET_CHANGED" and "target" or "focus"
-        cutCache[token] = nil
         mapDirty = true
         MarkUnit(token)
     elseif event == "GROUP_ROSTER_UPDATE" or event == "PLAYER_ENTERING_WORLD" then
-        wipe(cutCache)
         RebuildRoster()
         Scan()
+        SyncAllHots()
         MarkAll()
+    elseif event == "PLAYER_REGEN_ENABLED" then
+        -- Auras are readable again: correct what was tracked in combat, and
+        -- apply settings the HoT aura slots refused in combat.
+        SyncAllHots()
+        if hotRestyle then RestyleHots() end
     elseif event == "ADDON_LOADED" then
         if arg1 == ADDON_NAME then ns.InitDB() end
     elseif event == "PLAYER_LOGIN" then
@@ -1184,9 +1557,18 @@ events:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4)
         events:RegisterEvent("GROUP_ROSTER_UPDATE")
         events:RegisterEvent("PLAYER_ENTERING_WORLD")
         events:RegisterEvent("PLAYER_TARGET_CHANGED")
+        events:RegisterEvent("PLAYER_REGEN_ENABLED")
         pcall(events.RegisterEvent, events, "PLAYER_FOCUS_CHANGED")   -- not on every client
         if ns.InitOptions then ns.InitOptions() end
         playerClass = select(2, UnitClass("player"))
+        for id, info in pairs(HOT_SPELLS) do
+            local name = SpellName(id)
+            if name and not issecretvalue(name) then
+                info.name = name
+                hotByName[name] = info
+            end
+        end
+        ScanHotRanks()
         RebuildRoster()
         Scan()
         -- EllesmereUI builds buttons lazily (party header, extra frames, frame reloads).
@@ -1208,6 +1590,10 @@ local function Status()
     print("  Party & raid shared: " .. tostring(ns.db.sharePartyRaid))
     print("  Last heal amounts secret: " .. tostring(ns.stats.secretAmounts))
     print("  Group healers with class-colored bars: " .. (#roster / 2))
+    print(("  HoT aura slots: %s, %d frames ready, %d waiting%s"):format(
+        hotRanksReady and (ns.stats.hotRanks .. " spell IDs") or "collecting spell IDs",
+        ns.stats.hotSlotsBuilt, #hotQueue,
+        ns.stats.hotSlotsError and (", |cffff4040last error:|r " .. tostring(ns.stats.hotSlotsError)) or ""))
     -- Which unit tokens repaint each unit frame (target/focus also list their group token).
     if mapDirty then RebuildMap() end
     for _, uf in ipairs(UNIT_FRAMES) do
@@ -1233,6 +1619,11 @@ local function Status()
     local measured = 0
     for _ in pairs(healSizes) do measured = measured + 1 end
     print("  Spells with measured heals: " .. measured .. " (/bhb heals lists them)")
+    local now = GetTime()
+    for key, h in pairs(myHots) do
+        print(("  Your HoT %s: %d of %d ticks left, %d to heal"):format(key, HotTicksLeft(h, now), h.ticks,
+            Round(HotTicksLeft(h, now) * h.total / h.ticks)))
+    end
     local c = ns.stats.lastCast
     if c then
         print(("  Last cast: %s (%d), size %s from %s"):format(SpellLabel(c.spell), c.spell,
@@ -1244,11 +1635,87 @@ local function Status()
     if ns.stats.lastError then print("  Last error: " .. ns.stats.lastError) end
 end
 
--- /bhb auras [unit]: the unit's debuffs and which of their fields this client hides.
-local AURA_FIELDS = { "name", "spellId", "applications", "dispelName", "sourceUnit", "auraInstanceID", "duration", "points" }
+-- /bhb auras [unit] [buffs] [mine]: the unit's debuffs (or buffs; mine: only
+-- yours), which auras and fields this client hides, and whether lookups by
+-- name still work on hidden ones.
+local AURA_FIELDS = {
+    "name", "spellId", "applications", "dispelName", "sourceUnit", "auraInstanceID", "duration",
+    "expirationTime", "points",
+}
+local HOT_PROBES = {}   -- Rank 1 of each HoT (every rank shares the name)
+for id in pairs(HOT_SPELLS) do HOT_PROBES[#HOT_PROBES + 1] = id end
+table.sort(HOT_PROBES)
 
-local function DumpAuras(unit)
-    if unit == "" then unit = "target" end
+local function TimeLeft(exp, now)
+    if issecretvalue(exp) then return Readable(exp) end
+    if type(exp) ~= "number" then return "?" end
+    return exp > 0 and ("%.1fs"):format(exp - now) or "no end"
+end
+
+-- Looks each spell up on the unit by name and by (Rank 1) spell ID.
+local function ProbeByName(unit, filter, ids)
+    local get = C_UnitAuras.GetAuraDataBySpellName
+    if not get then
+        print("  Lookup by name: |cffff4040C_UnitAuras.GetAuraDataBySpellName missing|r")
+        return
+    end
+    local now = GetTime()
+    for _, id in ipairs(ids) do
+        local name = C_Spell.GetSpellName(id)
+        if name and not issecretvalue(name) then
+            local ok, a = pcall(get, unit, name, filter)
+            local res
+            if not ok then
+                res = "|cffff4040error: " .. tostring(a) .. "|r"
+            elseif issecretvalue(a) then
+                res = "|cffff4040secret|r"
+            elseif a == nil then
+                res = "not on unit"
+            else
+                res = ("|cff40ff40found|r, ID %s, from %s, %s left"):format(Readable(a.spellId, "?"),
+                    Readable(a.sourceUnit, "?"), TimeLeft(a.expirationTime, now))
+            end
+            print(("  Lookup %s: %s"):format(name, res))
+            -- By spell ID: nil and secret data are told apart.
+            local byID = C_UnitAuras.GetUnitAuraBySpellID
+            if byID then
+                local ok2, b = pcall(byID, unit, id)
+                local r2 = not ok2 and ("|cffff4040error: " .. tostring(b) .. "|r")
+                    or issecretvalue(b) and "|cffff4040secret|r"
+                    or b == nil and "nil"
+                    or ("|cff40ff40found|r, spell ID %s, %s left"):format(Readable(b.spellId, "?"),
+                        TimeLeft(b.expirationTime, now))
+                print(("  Lookup by ID %d: %s"):format(id, r2))
+            end
+        end
+    end
+end
+
+local function SecretsReport()
+    if not C_Secrets then
+        print("  C_Secrets: |cffff4040missing|r")
+        return
+    end
+    local names = {}
+    for k, v in pairs(C_Secrets) do
+        if type(v) == "function" then names[#names + 1] = k end
+    end
+    table.sort(names)
+    print("  C_Secrets: " .. table.concat(names, ", "))
+    if C_Secrets.ShouldAurasBeSecret then
+        local ok, v = pcall(C_Secrets.ShouldAurasBeSecret)
+        print("  ShouldAurasBeSecret(): " .. (ok and Readable(v, "nil") or ("error: " .. tostring(v))))
+    end
+end
+
+local function DumpAuras(args)
+    local unit, buffs, mine
+    for w in args:gmatch("%S+") do
+        if w == "buffs" or w == "buff" then buffs = true
+        elseif w == "mine" then mine = true
+        else unit = unit or w end
+    end
+    unit = unit or "target"
     if not (C_UnitAuras and C_UnitAuras.GetAuraDataByIndex) then
         Print("|cffff4040this client has no C_UnitAuras.GetAuraDataByIndex.|r")
         return
@@ -1257,103 +1724,196 @@ local function DumpAuras(unit)
         Print("no unit " .. unit)
         return
     end
-    -- Heal cuts only matter on units you can heal.
+    -- HoTs only matter on units you can heal.
     local friend = UnitIsFriend("player", unit)
     if not issecretvalue(friend) and not friend then
         Print(unit .. " isn't friendly; target a group member or use a token such as party1.")
         return
     end
-    Print(("debuffs on %s (%s), you are %s"):format(unit, Readable(UnitName(unit), "?"),
+    local kind = (mine and "your " or "") .. (buffs and "buffs" or "debuffs")
+    local filter = (buffs and "HELPFUL" or "HARMFUL") .. (mine and "|PLAYER" or "")
+    Print(("%s on %s (%s), you are %s"):format(kind, unit, Readable(UnitName(unit), "?"),
         InCombatLockdown() and "|cffff4040in combat|r" or "|cff40ff40out of combat|r"))
-    local hidden, n = {}, 0
+    local hidden, n, blocked, now = {}, 0, 0, GetTime()
     for i = 1, 40 do
-        local a = C_UnitAuras.GetAuraDataByIndex(unit, i, "HARMFUL")
-        if not a then break end
+        local a = ReadAura(unit, i, filter)
+        if a == nil then break end
         n = i
-        for _, f in ipairs(AURA_FIELDS) do
-            if issecretvalue(a[f]) then hidden[f] = true end
-        end
-        local pts, ptsText = a.points, "none"
-        if issecretvalue(pts) then
-            ptsText = Readable(pts)
-        elseif type(pts) == "table" and #pts > 0 then
-            local t = {}
-            for j = 1, #pts do
-                if issecretvalue(pts[j]) then hidden.points = true end
-                t[j] = Readable(pts[j])
+        if not a then
+            blocked = blocked + 1
+            print(("  %d |cffff4040hidden from addons|r"):format(i))
+        else
+            for _, f in ipairs(AURA_FIELDS) do
+                if issecretvalue(a[f]) then hidden[f] = true end
             end
-            ptsText = table.concat(t, ", ")
+            local pts, ptsText = a.points, "none"
+            if issecretvalue(pts) then
+                ptsText = Readable(pts)
+            elseif type(pts) == "table" and #pts > 0 then
+                local t = {}
+                for j = 1, #pts do
+                    if issecretvalue(pts[j]) then hidden.points = true end
+                    t[j] = Readable(pts[j])
+                end
+                ptsText = table.concat(t, ", ")
+            end
+            print(("  %d %s (%s) x%s, %s, from %s, instance %s, %ss, %s left, points: %s"):format(i,
+                Readable(a.name, "?"), Readable(a.spellId, "?"), Readable(a.applications, 0),
+                Readable(a.dispelName, "no type"), Readable(a.sourceUnit, "?"), Readable(a.auraInstanceID, "?"),
+                Readable(a.duration, "?"), TimeLeft(a.expirationTime, now), ptsText))
         end
-        local cut = not issecretvalue(a.spellId) and ns.HEAL_CUTS[a.spellId]
-        print(("  %d %s (%s) x%s, %s, from %s, instance %s, %ss, points: %s%s"):format(i,
-            Readable(a.name, "?"), Readable(a.spellId, "?"), Readable(a.applications, 0),
-            Readable(a.dispelName, "no type"), Readable(a.sourceUnit, "?"), Readable(a.auraInstanceID, "?"),
-            Readable(a.duration, "?"), ptsText,
-            cut and (" |cffff4040[heal cut -%d%%, %s]|r"):format(cut.pct, cut.group) or ""))
     end
-    if n == 0 then print("  no debuffs") return end
-    cutCache[unit] = nil
-    local mod = UnitHealMod(unit)
-    print("  Healing reduction counted: " .. (mod < 1 and ("|cffff4040-%d%%|r"):format(CutPercent(mod)) or "none"))
+    if n == 0 then print("  no " .. kind) end
+    if blocked == 40 then
+        print("  |cffff4040Every aura slot reads as hidden, empty ones included, so the count can't be known.|r")
+    elseif blocked > 0 then
+        print(("  Auras hidden from addons: |cffff4040%d of %d|r"):format(blocked, n))
+    end
     local list = {}
     for _, f in ipairs(AURA_FIELDS) do
         if hidden[f] then list[#list + 1] = f end
     end
     print("  Hidden fields: " .. (#list > 0 and ("|cffff4040" .. table.concat(list, ", ") .. "|r") or "|cff40ff40none|r"))
-    print("  Lookup by name (C_UnitAuras.GetAuraDataBySpellName): "
-        .. (C_UnitAuras.GetAuraDataBySpellName and "available" or "|cffff4040missing|r"))
+    if buffs then
+        ProbeByName(unit, filter, HOT_PROBES)
+        -- What the addon tracks from your casts, for comparison.
+        local tracked = 0
+        for key, h in pairs(myHots) do
+            if HotOnUnit(unit, h) then
+                tracked = tracked + 1
+                print(("  Tracked HoT %s: %d of %d ticks left, %d to heal"):format(key, HotTicksLeft(h, now),
+                    h.ticks, Round(HotTicksLeft(h, now) * h.total / h.ticks)))
+            end
+        end
+        if tracked == 0 then print("  Tracked HoTs of yours: none") end
+    end
+    SecretsReport()
 end
 
+-- /bhb secrets: what this client keeps secret about auras, and the aura API it has.
+local function SecretsDump()
+    Print("secrets, you are " .. (InCombatLockdown() and "|cffff4040in combat|r" or "|cff40ff40out of combat|r"))
+    SecretsReport()
+    for name, enum in pairs(Enum or EMPTY) do
+        if name:find("Secre") and type(enum) == "table" then
+            local vals = {}
+            for k, v in pairs(enum) do vals[#vals + 1] = k .. " = " .. tostring(v) end
+            table.sort(vals)
+            print(("  Enum.%s: %s"):format(name, table.concat(vals, ", ")))
+        end
+    end
+    local fns = {}
+    for k, v in pairs(C_UnitAuras or EMPTY) do
+        if type(v) == "function" then fns[#fns + 1] = k end
+    end
+    table.sort(fns)
+    print("  C_UnitAuras: " .. table.concat(fns, ", "))
+    local S = C_Secrets or EMPTY
+    for _, id in ipairs(HOT_PROBES) do
+        local ok1, secret = pcall(S.ShouldSpellAuraBeSecret, id)
+        local ok2, level = pcall(S.GetSpellAuraSecrecy, id)
+        print(("  %s (%d): secret %s, secrecy %s"):format(tostring(C_Spell.GetSpellName(id)), id,
+            ok1 and Readable(secret, "nil") or "error", ok2 and Readable(level, "nil") or "error"))
+    end
+    -- HoT tracking finds your cast's target by name or GUID.
+    for _, u in ipairs({ "player", "party1", "target" }) do
+        if UnitExists(u) then
+            local ok, secret = pcall(S.ShouldUnitIdentityBeSecret, u)
+            print(("  %s: identity secret %s, name %s, GUID %s"):format(u, ok and Readable(secret, "nil") or "error",
+                Readable(UnitName(u), "nil"), Readable(UnitGUID(u), "nil")))
+        end
+    end
+end
+
+-- /bhb auralog [unit]: prints each UNIT_AURA payload for one unit, and whether
+-- its auras can be read by instance ID (the slot order is hidden in combat).
+ns.auraLog = nil
+
+local function ReadInstance(unit, id)
+    if issecretvalue(id) then return "ID " .. Readable(id) end
+    local check = C_Secrets and C_Secrets.ShouldUnitAuraInstanceBeSecret
+    local verdict = ""
+    if check then
+        local ok, secret = pcall(check, unit, id)
+        verdict = ", instance secret " .. (ok and Readable(secret, "nil") or "error")
+    end
+    local get = C_UnitAuras.GetAuraDataByAuraInstanceID
+    if not get then return ("ID %d%s, no GetAuraDataByAuraInstanceID"):format(id, verdict) end
+    local ok, a = pcall(get, unit, id)
+    local res
+    if not ok then
+        res = "|cffff4040read failed: " .. tostring(a) .. "|r"
+    elseif issecretvalue(a) then
+        res = "|cffff4040read: secret|r"
+    elseif a == nil then
+        res = "read: nil"
+    else
+        res = ("|cff40ff40read|r %s (%s) from %s, %s left"):format(Readable(a.name, "?"), Readable(a.spellId, "?"),
+            Readable(a.sourceUnit, "?"), TimeLeft(a.expirationTime, GetTime()))
+    end
+    return ("ID %d%s, %s"):format(id, verdict, res)
+end
+
+local function LogAuraEvent(unit, info)
+    local head = "|cff33ccffBHB|r UNIT_AURA " .. unit .. (InCombatLockdown() and " (in combat)" or "")
+    if info == nil then print(head .. ": no update info") return end
+    if issecretvalue(info) then print(head .. ": update info is secret") return end
+    print(head .. ", full update: " .. Readable(info.isFullUpdate, "false"))
+    local added = info.addedAuras
+    if issecretvalue(added) then
+        print("  added: |cffff4040secret list|r")
+    elseif added then
+        for _, a in ipairs(added) do
+            if issecretvalue(a) then
+                print("  added: |cffff4040secret aura|r")
+            else
+                print(("  added %s (%s) from %s, helpful %s; %s"):format(Readable(a.name, "?"), Readable(a.spellId, "?"),
+                    Readable(a.sourceUnit, "?"), Readable(a.isHelpful, "?"), ReadInstance(unit, a.auraInstanceID)))
+            end
+        end
+    end
+    for _, key in ipairs({ "updatedAuraInstanceIDs", "removedAuraInstanceIDs" }) do
+        local list = info[key]
+        if issecretvalue(list) then
+            print("  " .. key .. ": |cffff4040secret list|r")
+        elseif list then
+            for _, id in ipairs(list) do
+                print("  " .. (key == "updatedAuraInstanceIDs" and "updated " or "removed ")
+                    .. (key == "updatedAuraInstanceIDs" and ReadInstance(unit, id) or ("ID " .. Readable(id))))
+            end
+        end
+    end
+end
+ns.LogAuraEvent = LogAuraEvent   -- the event handler is defined above this
+
 -------------------------------------------------------------------------------
---  /bhb scan: walks spell IDs for descriptions that read like healing
---  reduction and saves them to BetterHealBarsDB.healCutScan, each with a line
---  ready for HealCuts.lua. English descriptions only; review before using.
+--  /bhb scan: walks spell IDs for descriptions that read like a heal over
+--  time and saves them to BetterHealBarsDB.hotScan, each with a line in the
+--  HOT_SPELLS format. English descriptions only; review before using.
 -------------------------------------------------------------------------------
 local SCAN_DEFAULT_MAX = 60000
 local SCAN_BUDGET_MS = 8   -- per frame
--- A sentence counts when it has one of these (lowercase Lua patterns)...
-local SCAN_HEAL_PHRASES = {
-    "healing effects", "healing received", "healing taken", "heals received",
-    "effectiveness of [%a%s]-heal", "healing done to", "reduc%a* healing by",
-}
--- ...and one of these.
-local SCAN_LESS_WORDS = { "reduc", "decreas", "lower", "less" }
+local SCAN_LOAD_WAIT = 5   -- seconds without a load result before giving up on the rest
+local SCAN_PRINT_MAX = 40  -- results printed to chat
 local scanState
-
-local function HasAny(s, patterns)
-    for i = 1, #patterns do
-        if s:find(patterns[i]) then return true end
-    end
-    return false
-end
-
--- The first sentence of the text that reads like healing reduction, or nil.
-local function HealCutSentence(text)
-    text = text:lower():gsub("[\r\n]+", ". ")
-    for s in (text .. ". "):gmatch("(.-)%.%s+") do
-        if HasAny(s, SCAN_HEAL_PHRASES) and HasAny(s, SCAN_LESS_WORDS) then return s end
-    end
-end
 
 -- Returns false when the spell has no description to read (yet).
 local function CheckDescription(st, id, name)
     local text = SpellDescription(id)
     if not text or text == "" then return false end
     st.described = st.described + 1
-    local s = HealCutSentence(text)
-    if not s then return true end
-    -- The amount follows the healing part ("...any healing by 50%"); numbers
-    -- before it are other effects (weapon damage, proc chance).
-    local amount, isPct = s:match("heal.-by (%d+)(%%?)")
-    amount = tonumber(amount)
-    local pct = isPct == "%" and amount or nil
-    local label = SpellLabel(id)
-    st.results[#st.results + 1] = {
-        id = id, name = label, pct = pct, text = text,
-        flat = not pct and amount or nil,
-        listed = ns.HEAL_CUTS[id] and true or nil,
-        line = pct and ("[%d] = { pct = %d, group = %q }, -- %s"):format(id, pct, name:lower(), label) or nil,
-    }
+    local total, duration = HotFromText(text)
+    if total then
+        -- The tick interval isn't in the text: 3 sec is the usual one, so check it.
+        local label = SpellLabel(id)
+        local food = text:lower():find("seated") and true or nil
+        st.hots[#st.hots + 1] = {
+            id = id, name = label, total = total, duration = duration, text = text, food = food,
+            listed = hotByName[name] and true or nil,
+            line = ("[%d] = { tick = 3 }, -- %s: %d over %d sec%s"):format(id, label, total, duration,
+                food and " (food/drink)" or ""),
+        }
+    end
     return true
 end
 
@@ -1371,8 +1931,6 @@ local function ScanOne(st, id)
         C_Spell.RequestLoadSpellData(id)
     end
 end
-
-local SCAN_LOAD_WAIT = 5   -- seconds without a load result before giving up on the rest
 
 local scanFrame = CreateFrame("Frame")
 scanFrame:Hide()
@@ -1395,32 +1953,43 @@ local function FinishScan(stopped)
     scanFrame:UnregisterAllEvents()
     local st = scanState
     scanState = nil
-    local results = st.results
-    table.sort(results, function(a, b) return a.id < b.id end)
-    ns.db.healCutScan = {
+    local hots = st.hots
+    table.sort(hots, function(a, b) return a.id < b.id end)
+    ns.db.hotScan = {
         build = (GetBuildInfo()), date = date("%Y-%m-%d %H:%M"), scannedTo = st.next - 1,
-        highestSpell = st.highest, results = results,
+        highestSpell = st.highest, results = hots,
     }
-    Print(("scan %s at ID %d: %d spells, %d with a description (%d loaded on request, %d never arrived), "
-        .. "%d read like healing reduction."):format(stopped and "stopped" or "done", st.next - 1, st.found,
-        st.described, st.loaded, st.pendingCount, #results))
+
+    Print(("scan %s at ID %d: %d spells, %d with a description (%d loaded on request, %d never arrived)."):format(
+        stopped and "stopped" or "done", st.next - 1, st.found, st.described, st.loaded, st.pendingCount))
     if st.described == 0 then
         Print("|cffff4040no spell descriptions could be read.|r Check one by hand: "
-            .. "/dump C_Spell.GetSpellDescription(12294)")
+            .. "/dump C_Spell.GetSpellDescription(139)")
     end
-    for i = 1, math.min(#results, 40) do
-        local r = results[i]
-        print(("  %d %s: %s%s"):format(r.id, r.name,
-            r.pct and ("-" .. r.pct .. "%") or r.flat and ("-" .. r.flat .. " flat") or "no amount",
-            r.listed and " |cff40ff40(listed)|r" or ""))
+
+    -- Food and drink are most of them; they're saved but not printed.
+    local food, shown = 0, 0
+    for _, r in ipairs(hots) do
+        if r.food then food = food + 1 end
     end
-    if #results > 40 then print(("  ...and %d more in the saved file"):format(#results - 40)) end
+    Print(("%d read like a heal over time (%d of them food or drink, not listed here):"):format(#hots, food))
+    for _, r in ipairs(hots) do
+        if not r.food then
+            shown = shown + 1
+            if shown <= SCAN_PRINT_MAX then
+                print(("  %d %s: %d over %ds%s"):format(r.id, r.name, r.total, r.duration,
+                    r.listed and " |cff40ff40(tracked)|r" or ""))
+            end
+        end
+    end
+    if shown > SCAN_PRINT_MAX then print(("  ...and %d more in the saved file"):format(shown - SCAN_PRINT_MAX)) end
+
     if st.errors > 0 then print(("  |cffff4040%d spell IDs couldn't be read.|r"):format(st.errors)) end
     if not stopped and st.highest > st.max - 5000 then
         Print(("spells exist up to ID %d; there may be more. Try /bhb scan %d."):format(st.highest, st.max * 2))
     end
-    Print("/reload writes the full list (descriptions and HealCuts.lua lines) to "
-        .. "WTF\\Account\\<account>\\SavedVariables\\BetterHealBars.lua, under healCutScan.")
+    Print("/reload writes the full list (descriptions and ready-made lines) to "
+        .. "WTF\\Account\\<account>\\SavedVariables\\BetterHealBars.lua, under hotScan.")
 end
 
 scanFrame:SetScript("OnUpdate", function()
@@ -1438,7 +2007,7 @@ scanFrame:SetScript("OnUpdate", function()
         if not ok then st.errors = st.errors + 1 end
         st.next = st.next + 1
         if st.next % 10000 == 0 then
-            Print(("scan at ID %d of %d, %d found so far."):format(st.next, st.max, #st.results))
+            Print(("scan at ID %d of %d, %d HoTs so far."):format(st.next, st.max, #st.hots))
         end
     end
     if st.next > st.max then
@@ -1454,8 +2023,8 @@ local function StartScan(arg)
         return
     end
     if scanState then
-        Print(("scan running: ID %d of %d, %d found. /bhb scan stop ends it."):format(
-            scanState.next, scanState.max, #scanState.results))
+        Print(("scan running: ID %d of %d, %d HoTs. /bhb scan stop ends it."):format(
+            scanState.next, scanState.max, #scanState.hots))
         return
     end
     if not (C_Spell and C_Spell.GetSpellName) then
@@ -1464,10 +2033,10 @@ local function StartScan(arg)
     end
     local max = tonumber(arg) or SCAN_DEFAULT_MAX
     scanState = {
-        next = 1, max = max, found = 0, highest = 0, errors = 0, results = {},
+        next = 1, max = max, found = 0, highest = 0, errors = 0, hots = {},
         described = 0, loaded = 0, pending = {}, pendingCount = 0,
     }
-    Print(("scanning spell IDs 1 to %d for healing reduction..."):format(max))
+    Print(("scanning spell IDs 1 to %d for heals over time..."):format(max))
     pcall(scanFrame.RegisterEvent, scanFrame, "SPELL_DATA_LOAD_RESULT")   -- not on every client
     scanFrame:Show()
 end
@@ -1500,6 +2069,18 @@ SlashCmdList.BETTERHEALBARS = function(msg)
     elseif msg == "resetheals" then
         wipe(healSizes)
         Print("measured heal sizes cleared; tooltip averages are used until new heals are measured.")
+    elseif msg == "secrets" then
+        local ok, err = pcall(SecretsDump)
+        if not ok then Print("|cffff4040secrets report failed:|r " .. tostring(err)) end
+    elseif msg:match("^auralog") then
+        local u = msg:match("^auralog%s*(%S*)")
+        if u == "" and ns.auraLog then
+            ns.auraLog = nil
+            Print("aura log off")
+        else
+            ns.auraLog = u ~= "" and u or "target"
+            Print("aura log on for " .. ns.auraLog .. ": every aura change on it prints. /bhb auralog turns it off.")
+        end
     elseif msg:match("^scan") then
         StartScan(msg:match("^scan%s*(.*)$"))
     elseif msg:match("^auras") then
